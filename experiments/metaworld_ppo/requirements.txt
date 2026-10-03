@@ -1,0 +1,29 @@
+# Meta-World multi-task PPO. Python 3.12.
+#
+# Tested with: the versions recorded in the requirements.txt that W&B captured
+# for the Meta-World PPO runs of the public W&B project (822 of its 823
+# Meta-World PPO runs carry that file).
+#   all 822:   metaworld 3.0.0, tianshou 2.0.0, pyyaml 6.0.3, tensorboard 2.20.0
+#   headline groups mt{10,50}v2_ppo_apc_cfg1_npaw_lnc_vc1_400x3 (all 20 runs):
+#     torch==2.10.0 (+cu128)  mujoco==3.7.0  numpy==2.4.4  gymnasium==1.2.3
+#     scipy==1.17.0  tyro==1.0.13  wandb==0.26.0
+#   range over the 822:
+#     torch 2.6.0 (+cu124) to 2.11.0, mujoco 3.4.0 to 3.8.0, numpy 2.3.5 to 2.4.4,
+#     gymnasium 1.2.3 (two runs 1.3.0), scipy 1.17.0 to 1.18.0, tyro 1.0.6 to 1.0.13
+# The bounds below are looser than that. To match the headline environment,
+# install the pins above on top of this file, taking torch from the wheel index
+# for your CUDA version. The unit tests also need requirements-dev.txt.
+metaworld==3.0.0
+tianshou==2.0.0
+torch>=2.0.0
+numpy>=1.24.0
+# metaworld 3.0.0 itself requires gymnasium>=1.1 and mujoco>=3.0.0
+gymnasium>=1.1
+mujoco>=3.0.0
+scipy
+pyyaml
+tyro
+wandb
+tensorboard
+imageio
+imageio-ffmpeg

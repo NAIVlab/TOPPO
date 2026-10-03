@@ -1,0 +1,86 @@
+# Return-based scaling + HL-Gauss (MT50-V1).
+# NEVER RUN beyond a short smoke test: no W&B group in the public project,
+# and no number in the paper comes from this config.
+# Tests whether return-based scaling, by bringing the per-task value targets
+# into similar ranges, lets a single HL-Gauss support range serve all tasks.
+# Parents: ppo_mt50_hlgauss_lnc_rfv1.yaml (critic side) + ppo_mt50_retscale_lnc_rfv1.yaml (critic-scale side).
+# Trunk hyperparameters inherited verbatim -- no per-arm tuning.
+# Support re-derived for the SCALED target R_i/s_i (per-task unit variance by
+# construction).  Per-task mu_i/sigma_i measured from the PopArt LN-c
+# rfv1 runs spans [-14.00, 6.59] (stable across seeds); support
+# [-20.0, 12.0] @ 400 bins => bin width 0.080, so each task's 4-sigma
+# envelope spans ~50 bins.
+
+project_name: toppo-repro
+exp_name: ppo_mt50_ad_cd_hlgaussretscale_lnc_rfv1
+seed: 0
+device: cuda
+algo: ppo
+use_linear_baseline: false
+
+env:
+  env_name: MT50
+  max_episode_steps: 500
+  use_one_hot: true
+  num_tasks: 50
+  terminate_on_success: false
+  task_select: random
+  reward_normalization_method: null
+  num_envs: 50
+  reward_function_version: v1
+
+network:
+  preprocess_net: []
+  actor: [400, 400, 400]
+  critic: [400, 400, 400]
+  actor_head: []
+  critic_head: []
+  activation: relu
+  ln_critic: true
+
+training:
+  epoch: 100
+  step_per_epoch: 1000000
+  step_per_collect: 500000
+  repeat_per_collect: 16
+  batch_size: 15625
+  minibatch_sampling: stratified
+  learning_rate: 0.0003
+  gamma: 0.99
+  max_grad_norm: 1.0
+
+ppo:
+  gae_lambda: 0.97
+  clip_range: 0.2
+  value_clip: false
+  vf_coef: 0.001
+  ent_coef: 0.005
+  advantage_normalization: true
+  recompute_advantage: true
+  use_popart: false
+  popart_min_std: 0.01
+  use_return_scaling: true
+  return_scaling_min_sigma: 0.01
+  critic_loss_mode: hlgauss
+  hlgauss_num_bins: 400
+  hlgauss_vmin: -20.0
+  hlgauss_vmax: 12.0
+  hlgauss_sigma_ratio: 0.75
+
+gradient:
+  actor_method: default
+  critic_method: default
+
+logging:
+  use_wandb: true
+  use_tensorboard: false
+  use_csv: true
+  train_interval: 2000
+  test_interval: 2
+  update_interval: 1
+  info_interval: 1
+  save_interval: 1000000
+  save_best: false
+  log_dir: logs
+  wandb_group: ppo_mt50_ad_cd_hlgaussretscale_lnc_rfv1
+  wandb_tags: [mt50, rfv1, lnc]

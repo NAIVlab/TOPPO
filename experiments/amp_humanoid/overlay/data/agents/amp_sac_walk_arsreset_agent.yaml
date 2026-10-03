@@ -1,0 +1,102 @@
+# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0): the network,
+# discriminator and reward settings follow data/agents/amp_task_humanoid_agent.yaml; the
+# changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+
+# SAC + ARS arm, FAITHFUL variant WITH the periodic learner resets
+# (num_resets: 4). Otherwise identical to amp_sac_walk_ars_agent.yaml
+# (Adaptive Reward Scaling, Cho et al. ICML 2025, ported to the AMP
+# reward-component axis).
+#
+# ARS is a REWARD-side answer to component scale imbalance: it equalizes the
+# mean magnitude of every reward component, scale[k] = max_j(mean_j) /
+# max(mean_k, 0.01), and applies it multiplicatively to the stored rewards.
+# Our stack is the CRITIC-side answer (PopArt on value targets, LN-c, FairGrad
+# on the per-component gradients). This arm is therefore the head-to-head
+# reward-side vs critic-side comparison.
+#
+# The architecture is byte-identical to amp_sac_walk_agent.yaml (scalar
+# twin-Q, no component head, no LN, no PopArt): the ONLY difference is the
+# reward scale, so the comparison isolates ARS.
+#
+# Port notes (see mimickit/learning/sac_agent.py::_update_ars_scale):
+# - In Meta-World the axis is tasks with stationary rewards; here it is the two
+#   AMP components, and the style component is non-stationary (re-labeled from
+#   the current discriminator). The means are therefore estimated with the
+#   CURRENT discriminator over a large replay sample, and refreshed at
+#   `rescale_points` evenly spaced points rather than only once.
+# - `num_resets` controls the faithful ARS learner re-initialization (with
+#   `warm_start_updates` offline updates from the retained buffer). The AMP
+#   discriminator, replay buffer and normalizers are retained across a reset:
+#   the reference has no learned reward, so resetting the discriminator would
+#   reset the reward function rather than the learner.
+agent_name: AMPSAC
+
+model:
+  actor_net: fc_2layers_1024units
+  actor_init_output_scale: 0.01
+  actor_init_logstd: -1.0
+  actor_logstd_min: -5.0
+  actor_logstd_max: 2.0
+  critic_net: fc_2layers_1024units
+  num_critics: 2
+  disc_net: fc_2layers_1024units
+
+actor_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+
+critic_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+  grad_clip: 0.0
+
+alpha_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+
+disc_optimizer:
+  type: SGD
+  learning_rate: 2.5e-4
+  weight_decay: 0.0001
+
+discount: 0.99
+steps_per_iter: 8
+iters_per_output: 40
+test_episodes: 32
+normalizer_samples: 100000000
+use_mixed_precision: false
+
+batch_size: 4096
+updates_per_iter: 64
+replay_buffer_size: 1000000
+# 98304 = exactly 3 collection iterations (3 x 8 x 4096)
+min_buffer_samples: 98304
+random_action_samples: 98304
+tau: 0.005
+init_alpha: 1.0
+learn_alpha: true
+target_entropy: auto
+actor_critic_agg: min
+
+# disc_batch_size is a MULTIPLIER of num_envs (as in the AMP-PPO yamls): 2 ->
+# 8192. 8 updates x 8192 per 32768 collected samples reproduces AMP-PPO's
+# discriminator budget exactly: 1 optimizer step / 4096 samples, 2 demo, 2
+# current-window-negative and 2 replay-negative examples per collected sample.
+disc_batch_size: 2
+disc_updates_per_iter: 8
+disc_buffer_size: 200000
+disc_replay_samples: 1000
+disc_logit_reg: 0.01
+disc_grad_penalty: 5
+disc_reward_scale: 2
+
+task_reward_weight: 0.5
+disc_reward_weight: 0.5
+
+ars:
+  enabled: true
+  min_mean: 0.01
+  scale_samples: 65536
+  rescale_points: 4
+  num_resets: 4
+  warm_start_updates: 1000

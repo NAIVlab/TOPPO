@@ -1,0 +1,2193 @@
+--- a/common.py
++++ b/common.py
+@@ -667,9 +667,103 @@
+ 
+ 
+ @flax.struct.dataclass
++class MultiModelFairGrad:
++    """MultiModel whose apply_gradient combines per-task gradients with
++    FairGrad (Ban & Ji 2024, alpha=1 = Nash bargaining) instead of PCGrad
++    projection — the critic-side balancing (FG-c) of the TOPPO critic stack.
++
++    ``loss_fn`` must return a per-task loss VECTOR (same contract as the
++    PCGrad loss fns); the (K, K) Gram system is solved on the host in fp64
++    via jax.pure_callback (see fairgrad_host.py).  The combined gradient is
++    ``sum_i w_i g_i`` with norm pinned at sqrt(K) (Theorem 1) — no rescale,
++    matching the paper's fairgrad_rescale=False default.
++    """
++
++    step: int
++    # static (not traced): n_task shapes jnp.arange in the taskwise flatten;
++    # fairgrad_alpha is closed over by the pure_callback callable.
++    n_task: int = flax.struct.field(pytree_node=False)
++    fairgrad_alpha: float = flax.struct.field(pytree_node=False)
++    apply_fn: nn.Module = flax.struct.field(pytree_node=False)
++    params: Params
++    tx: Optional[optax.GradientTransformation] = flax.struct.field(pytree_node=False)
++    opt_state: Optional[optax.OptState] = None
++
++    @classmethod
++    def create(
++        cls,
++        model_def: nn.Module,
++        inputs: Sequence[jnp.ndarray],
++        tx: Optional[optax.GradientTransformation] = None,
++        n_task: int = 1,
++        fairgrad_alpha: float = 1.0,
++    ) -> "MultiModelFairGrad":
++        variables = model_def.init(*inputs)
++        params = variables.pop("params")
++        opt_state = tx.init(params) if tx else None
++        return cls(
++            step=1,
++            apply_fn=model_def,
++            params=params,
++            tx=tx,
++            opt_state=opt_state,
++            n_task=n_task,
++            fairgrad_alpha=fairgrad_alpha,
++        )
++
++    def __call__(self, *args, **kwargs):
++        return self.apply_fn.apply({"params": self.params}, *args, **kwargs)
++
++    def apply(self, *args, **kwargs):
++        return self.apply_fn.apply(*args, **kwargs)
++
++    def apply_gradient(self, loss_fn, n_task: int = 0):
++        from fairgrad_host import fairgrad_combine_flat
++
++        jacobian_fn = jax.jacrev(loss_fn, has_aux=True)
++        grads_per_task, info = jacobian_fn(self.params)
++
++        grads_per_task_flat, unravel_fn = flatten_taskwise_gradients(
++            grads_per_task, n_task or self.n_task
++        )  # (n_task, dim)
++
++        combined_flat, weights = fairgrad_combine_flat(
++            grads_per_task_flat, self.fairgrad_alpha
++        )
++        final_grad = unravel_fn(combined_flat)
++
++        updates, new_opt_state = self.tx.update(final_grad, self.opt_state, self.params)
++        new_params = optax.apply_updates(self.params, updates)
++
++        info = dict(info)
++        info["fairgrad_w"] = weights
++
++        return (
++            self.replace(
++                step=self.step + 1, params=new_params, opt_state=new_opt_state
++            ),
++            info,
++        )
++
++    def save(self, save_path: str):
++        os.makedirs(os.path.dirname(save_path), exist_ok=True)
++        with open(save_path, "wb") as f:
++            f.write(flax.serialization.to_bytes(self.params))
++
++    def load(self, load_path: str) -> "MultiModelFairGrad":
++        with open(load_path, "rb") as f:
++            params = flax.serialization.from_bytes(self.params, f.read())
++        return self.replace(params=params)
++
++
++@flax.struct.dataclass
+ class MultiModelPCGrad:
+     step: int
+-    n_task: int
++    # static so apply_gradient can default to the real task count (upstream
++    # hardcoded n_task=50 at the call sites via the parameter default, which
++    # NaN-poisons params on any n_task != 50 — jnp.take fills OOB with NaN).
++    # Values are identical on MT50, so MT50 behavior is unchanged.
++    n_task: int = flax.struct.field(pytree_node=False)
+     rng: jax.random.PRNGKey
+     apply_fn: nn.Module = flax.struct.field(pytree_node=False)
+     params: Params
+@@ -704,7 +798,8 @@
+     def apply(self, *args, **kwargs):
+         return self.apply_fn.apply(*args, **kwargs)
+ 
+-    def apply_gradient(self, loss_fn, n_task: int = 50) -> Tuple[Any, "Model"]:
++    def apply_gradient(self, loss_fn, n_task: int = 0) -> Tuple[Any, "Model"]:
++        n_task = n_task or self.n_task
+         jacobian_fn = jax.jacrev(loss_fn, has_aux=True)
+         grads_per_task, info = jacobian_fn(self.params)
+         # grads = jax.tree_util.tree_map(lambda g: jnp.mean(g, axis=0), jacobian)
+--- a/critic.py
++++ b/critic.py
+@@ -2,6 +2,7 @@
+ import jax.numpy as jnp
+ import jax
+ from common import Batch, InfoDict, Model, Params, PRNGKey
++import popart_jax
+ 
+ 
+ def sac_update_q(
+@@ -74,6 +75,103 @@
+     return new_critic, info
+ 
+ 
++def sac_update_q_popart(
++    key: PRNGKey,
++    actor: Model,
++    critic,
++    target_critic,
++    alpha: Model,
++    batch: Batch,
++    discount: float,
++    popart_state,
++    popart_method: str,
++    popart_ema_decay: float,
++    popart_min_std: float,
++    per_task_loss: bool,
++):
++    """Critic update with PopArt target normalization (critic balancing).
++
++    The critic outputs NORMALIZED q̂ (per-task affine head inside the
++    module); raw targets are formed by denormalizing the target critic's
++    bootstrap, stats are updated (ART), both critics' heads are POP-rescaled
++    to the new stats, and the TD loss is computed in normalized space.
++
++    Returns (new_critic, surgered_target_critic, new_popart_state, info).
++    ``per_task_loss=True`` yields the vector loss the PCGrad/FairGrad
++    apply_gradient expects; False the legacy scalar mean.
++    """
++    alpha_value = alpha()
++    dist = actor(batch.next_observations)
++    next_actions = dist.sample(seed=key)
++    next_log_probs = dist.log_prob(next_actions)
++
++    next_q_norm = jnp.min(
++        target_critic(batch.next_observations, next_actions), axis=0
++    )
++    # sigma > 0 => min over the ensemble commutes with the affine denorm
++    next_q_raw = popart_jax.denormalize(next_q_norm, popart_state)
++
++    # Temperature-scale consistency: the actor maximizes q_norm - alpha*logpi,
++    # i.e. alpha lives in NORMALIZED units.  The raw-space soft target must
++    # therefore use sigma_i * alpha_i so that, after normalization, the TD
++    # target matches the actor's objective exactly (otherwise the effective
++    # raw temperature drifts with each task's value scale).
++    alpha_raw = alpha_value * popart_state["sigma"][:, None]
++    target_q_raw = batch.rewards + discount * batch.masks * (
++        next_q_raw - alpha_raw * next_log_probs
++    )
++
++    new_state = popart_jax.update_stats(
++        popart_state, target_q_raw, popart_method, popart_ema_decay, popart_min_std
++    )
++    critic = critic.replace(
++        params=popart_jax.pop_rescale_params(critic.params, popart_state, new_state)
++    )
++    target_critic = target_critic.replace(
++        params=popart_jax.pop_rescale_params(
++            target_critic.params, popart_state, new_state
++        )
++    )
++    target_q = popart_jax.normalize_targets(target_q_raw, new_state)
++
++    if per_task_loss:
++
++        def critic_loss_fn(critic_params: Params) -> Tuple[jnp.ndarray, InfoDict]:
++            qs = critic.apply(
++                {"params": critic_params}, batch.observations, batch.actions
++            )
++            critic_loss = jnp.sum((qs - target_q) ** 2, axis=0)
++            return critic_loss.mean(axis=-1), {
++                "critic_loss": critic_loss.mean(axis=-1),
++                # "q" stays comparable with the non-popart arms: RAW scale
++                "q": popart_jax.denormalize(qs[0], new_state).mean(axis=-1),
++                "q_norm": qs[0].mean(axis=-1),
++                "popart_mu": new_state["mu"],
++                "popart_sigma": new_state["sigma"],
++            }
++
++    else:
++
++        def critic_loss_fn(
++            critic_params: Params, task_id=None
++        ) -> Tuple[jnp.ndarray, InfoDict]:
++            qs = critic.apply(
++                {"params": critic_params}, batch.observations, batch.actions
++            )
++            critic_loss = jnp.sum((qs - target_q) ** 2, axis=0)
++            return critic_loss[task_id].mean(), {
++                "critic_loss": critic_loss.mean(axis=-1),
++                "q": popart_jax.denormalize(qs[0], new_state).mean(axis=-1),
++                "q_norm": qs[0].mean(axis=-1),
++                "popart_mu": new_state["mu"],
++                "popart_sigma": new_state["sigma"],
++            }
++
++    new_critic, info = critic.apply_gradient(critic_loss_fn)
++
++    return new_critic, target_critic, new_state, info
++
++
+ def sac_update_alpha(
+     alpha: Model, log_pi: jnp.array, target_entropy: float
+ ) -> Tuple[Model, InfoDict]:
+--- a/dataset_utils.py
++++ b/dataset_utils.py
+@@ -1,8 +1,9 @@
+ import collections
+ from typing import Optional
+ 
+-import d4rl
+-import gym
++# NOTE: upstream imports d4rl here but never uses it; dropped so the online
++# multi-task path needs no offline-RL/mujoco_py stack.
++import gymnasium as gym  # type hints only (spaces.Box)
+ import numpy as np
+ from tqdm import tqdm
+ 
+@@ -194,15 +195,23 @@
+         use_heads: bool = False,
+     ):
+ 
++        # Store float64 obs as float32: JAX truncates f64 -> f32 at the jit
++        # boundary anyway (x64 off), so the learner sees bit-identical values
++        # while buffer RAM and checkpoint size halve (MT50@500k: 36 -> 18 GB).
++        obs_dtype = (
++            np.float32
++            if observation_space.dtype == np.float64
++            else observation_space.dtype
++        )
+         observations = np.empty(
+-            (n_task, capacity, *observation_space.shape), dtype=observation_space.dtype
++            (n_task, capacity, *observation_space.shape), dtype=obs_dtype
+         )
+         actions = np.empty((n_task, capacity, action_dim), dtype=np.float32)
+         rewards = np.empty((n_task, capacity), dtype=np.float32)
+         masks = np.empty((n_task, capacity), dtype=np.float32)
+         dones_float = np.empty((n_task, capacity), dtype=np.float32)
+         next_observations = np.empty(
+-            (n_task, capacity, *observation_space.shape), dtype=observation_space.dtype
++            (n_task, capacity, *observation_space.shape), dtype=obs_dtype
+         )
+ 
+         observations.fill(0.0)
+--- a/evaluation.py
++++ b/evaluation.py
+@@ -1,7 +1,7 @@
+ from typing import Dict
+ 
+ import flax.linen as nn
+-import gym
++import gymnasium as gym  # type hint only
+ import numpy as np
+ 
+ 
+--- a/learner_sac_mt.py
++++ b/learner_sac_mt.py
+@@ -1,4 +1,18 @@
+-"""Unified multi-task (multi-head) SAC learner with optional PCGrad support."""
++"""Unified multi-task (multi-head) SAC learner.
++
++Upstream (ms-cho/ARS) learner extended with per-side gradient-combiner
++selection and the TOPPO critic-balancing stack:
++
++  - ``actor_method``  : "default" | "pcgrad"
++  - ``critic_method`` : "default" | "pcgrad" | "fairgrad"  (FG-c, alpha=1)
++  - ``use_popart``    : PopArt per-task value-target normalization (with
++                        LN-c via ``critic_layernorm`` this completes the
++                        SAC port of the paper's critic stack)
++
++The legacy ``use_pcgrad=True`` maps to pcgrad on BOTH sides (bit-equivalent
++to upstream's ``_update_jit_pcgrad`` flow); all-default flags reproduce the
++upstream ``_update_jit`` flow exactly.
++"""
+ 
+ from typing import Optional, Sequence, Tuple
+ 
+@@ -9,6 +23,7 @@
+ import optax
+ 
+ import policy
++import popart_jax
+ import value_net
+ from actor import sac_update_actor, sac_update_actor_pcgrad
+ from common import (
+@@ -16,11 +31,17 @@
+     InfoDict,
+     Model,
+     MultiModel,
++    MultiModelFairGrad,
+     MultiModelPCGrad,
+     PRNGKey,
+     activation_func,
+ )
+-from critic import sac_update_alpha, sac_update_q, sac_update_q_pcgrad
++from critic import (
++    sac_update_alpha,
++    sac_update_q,
++    sac_update_q_pcgrad,
++    sac_update_q_popart,
++)
+ 
+ 
+ def target_update(critic: Model, target_critic: Model, tau: float) -> Model:
+@@ -30,76 +51,83 @@
+     return target_critic.replace(params=new_target_params)
+ 
+ 
+-@jax.jit
+-def _update_jit(
+-    rng: PRNGKey,
+-    actor: Model,
+-    critic: Model,
+-    target_critic: Model,
+-    alpha: Model,
+-    batch: Batch,
+-    discount: float,
+-    tau: float,
+-    target_entropy: float,
+-) -> Tuple[PRNGKey, Model, Model, Model, Model, Model, InfoDict]:
+-    key, rng = jax.random.split(rng)
+-    new_critic, critic_info = sac_update_q(
+-        key, actor, critic, target_critic, alpha, batch, discount
+-    )
+-
+-    key, rng = jax.random.split(rng)
+-    new_actor, actor_info = sac_update_actor(key, actor, new_critic, alpha, batch)
+-    new_alpha, alpha_info = sac_update_alpha(
+-        alpha, actor_info["log_pi"], target_entropy
+-    )
+-
+-    new_target_critic = target_update(new_critic, target_critic, tau)
+-
+-    return (
+-        rng,
+-        new_actor,
+-        new_critic,
+-        new_target_critic,
+-        new_alpha,
+-        {**critic_info, **actor_info, **alpha_info},
+-    )
+-
++def make_update_fn(
++    actor_method: str,
++    critic_method: str,
++    use_popart: bool,
++    popart_method: str,
++    popart_ema_decay: float,
++    popart_min_std: float,
++):
++    """Build the jitted update; method flags are static via closure."""
++    per_task_critic = critic_method in ("pcgrad", "fairgrad")
++
++    @jax.jit
++    def _update(
++        rng: PRNGKey,
++        actor,
++        critic,
++        target_critic,
++        alpha,
++        popart_state,
++        batch: Batch,
++        discount: float,
++        tau: float,
++        target_entropy: float,
++    ):
++        key, rng = jax.random.split(rng)
++        if use_popart:
++            new_critic, target_critic, new_popart, critic_info = sac_update_q_popart(
++                key,
++                actor,
++                critic,
++                target_critic,
++                alpha,
++                batch,
++                discount,
++                popart_state,
++                popart_method,
++                popart_ema_decay,
++                popart_min_std,
++                per_task_critic,
++            )
++        elif per_task_critic:
++            new_critic, critic_info = sac_update_q_pcgrad(
++                key, actor, critic, target_critic, alpha, batch, discount
++            )
++            new_popart = popart_state
++        else:
++            new_critic, critic_info = sac_update_q(
++                key, actor, critic, target_critic, alpha, batch, discount
++            )
++            new_popart = popart_state
+ 
+-@jax.jit
+-def _update_jit_pcgrad(
+-    rng: PRNGKey,
+-    actor: Model,
+-    critic: Model,
+-    target_critic: Model,
+-    alpha: Model,
+-    batch: Batch,
+-    discount: float,
+-    tau: float,
+-    target_entropy: float,
+-) -> Tuple[PRNGKey, Model, Model, Model, Model, Model, InfoDict]:
+-    key, rng = jax.random.split(rng)
+-    new_critic, critic_info = sac_update_q_pcgrad(
+-        key, actor, critic, target_critic, alpha, batch, discount
+-    )
++        key, rng = jax.random.split(rng)
++        if actor_method == "pcgrad":
++            new_actor, actor_info = sac_update_actor_pcgrad(
++                key, actor, new_critic, alpha, batch
++            )
++        else:
++            new_actor, actor_info = sac_update_actor(
++                key, actor, new_critic, alpha, batch
++            )
++        new_alpha, alpha_info = sac_update_alpha(
++            alpha, actor_info["log_pi"], target_entropy
++        )
+ 
+-    key, rng = jax.random.split(rng)
+-    new_actor, actor_info = sac_update_actor_pcgrad(
+-        key, actor, new_critic, alpha, batch
+-    )
+-    new_alpha, alpha_info = sac_update_alpha(
+-        alpha, actor_info["log_pi"], target_entropy
+-    )
++        new_target_critic = target_update(new_critic, target_critic, tau)
+ 
+-    new_target_critic = target_update(new_critic, target_critic, tau)
++        return (
++            rng,
++            new_actor,
++            new_critic,
++            new_target_critic,
++            new_alpha,
++            new_popart,
++            {**critic_info, **actor_info, **alpha_info},
++        )
+ 
+-    return (
+-        rng,
+-        new_actor,
+-        new_critic,
+-        new_target_critic,
+-        new_alpha,
+-        {**critic_info, **actor_info, **alpha_info},
+-    )
++    return _update
+ 
+ 
+ class Learner(object):
+@@ -123,23 +151,44 @@
+         activation: str = "tanh",
+         multi_head: bool = False,
+         use_pcgrad: bool = False,
++        actor_method: str = "default",
++        critic_method: str = "default",
++        fairgrad_critic_alpha: float = 1.0,
++        use_popart: bool = False,
++        popart_method: str = "ema",
++        popart_ema_decay: float = 3e-4,
++        popart_min_std: float = 1e-2,
+     ):
++        """Multi-task SAC learner.
++
++        ``use_pcgrad=True`` (legacy) forces pcgrad on both sides.  The
++        critic-balancing arm is ``critic_method="fairgrad"`` +
++        ``use_popart=True`` + ``critic_layernorm=True``.
+         """
+-        Multi-task SAC learner. Toggle `use_pcgrad` to enable PCGrad projection of
+-        per-task gradients; toggle `multi_head` to build separate policy heads.
+-        """
++
++        if use_pcgrad:
++            actor_method = "pcgrad"
++            critic_method = "pcgrad"
++        if actor_method not in ("default", "pcgrad"):
++            raise ValueError(f"actor_method {actor_method!r}")
++        if critic_method not in ("default", "pcgrad", "fairgrad"):
++            raise ValueError(f"critic_method {critic_method!r}")
+ 
+         self.tau = tau
+         self.discount = discount
+         self.n_task = n_task
+         self.use_pcgrad = use_pcgrad
++        self.actor_method = actor_method
++        self.critic_method = critic_method
++        self.use_popart = use_popart
+ 
+         critic_base_opt = optax.adam
+         actor_base_opt = optax.adam
+         rng = jax.random.PRNGKey(seed)
+         rng, actor_key, critic_key, alpha_key = jax.random.split(rng, 4)
+         actor_p_key = critic_p_key = None
+-        if use_pcgrad:
++        if actor_method == "pcgrad" or critic_method == "pcgrad":
++            # split exactly as upstream so use_pcgrad runs stay seed-comparable
+             rng, actor_p_key, critic_p_key = jax.random.split(rng, 3)
+ 
+         action_dim = actions.shape[-1]
+@@ -167,26 +216,26 @@
+             init_actions = actions[np.newaxis]
+         actor_def = actor_cls(**actor_kwargs)
+ 
+-        def _create_model(model_def, inputs, tx=None, rng_key=None):
+-            if use_pcgrad:
++        def _create_model(model_def, inputs, method, tx=None, rng_key=None):
++            if method == "pcgrad":
+                 return MultiModelPCGrad.create(
++                    model_def, inputs=inputs, tx=tx, n_task=n_task, rng=rng_key
++                )
++            if method == "fairgrad":
++                return MultiModelFairGrad.create(
+                     model_def,
+                     inputs=inputs,
+                     tx=tx,
+                     n_task=n_task,
+-                    rng=rng_key,
++                    fairgrad_alpha=fairgrad_critic_alpha,
+                 )
+-            return MultiModel.create(
+-                model_def,
+-                inputs=inputs,
+-                tx=tx,
+-                n_task=n_task,
+-            )
++            return MultiModel.create(model_def, inputs=inputs, tx=tx, n_task=n_task)
+ 
+         actor_opt = actor_base_opt(learning_rate=actor_lr)
+         actor = _create_model(
+             actor_def,
+             inputs=[actor_key, init_observations],
++            method=actor_method,
+             tx=actor_opt,
+             rng_key=actor_p_key,
+         )
+@@ -206,16 +255,20 @@
+             name="critic",
+             layer_norm=critic_layernorm,
+             init_layer_norm=critic_init_layernorm,
++            popart=use_popart,
++            n_task=n_task,
+         )
+         critic = _create_model(
+             critic_def,
+             inputs=[critic_key, init_observations, init_actions],
++            method=critic_method,
+             tx=critic_base_opt(learning_rate=critic_lr),
+             rng_key=critic_p_key,
+         )
+         target_critic = _create_model(
+             critic_def,
+             inputs=[critic_key, init_observations, init_actions],
++            method=critic_method,
+             rng_key=critic_p_key,
+         )
+         self.actor = actor
+@@ -223,8 +276,16 @@
+         self.critic = critic
+         self.models = {"alpha": self.alpha, "actor": self.actor, "critic": self.critic}
+         self.target_critic = target_critic
++        self.popart_state = popart_jax.init_state(n_task)
+ 
+-        self._update_fn = _update_jit_pcgrad if use_pcgrad else _update_jit
++        self._update_fn = make_update_fn(
++            actor_method,
++            critic_method,
++            use_popart,
++            popart_method,
++            popart_ema_decay,
++            popart_min_std,
++        )
+         self.rng = rng
+ 
+     def sample_actions(
+@@ -252,18 +313,25 @@
+         return np.clip(actions, -1, 1)
+ 
+     def update(self, batch: Batch) -> InfoDict:
+-        new_rng, new_actor, new_critic, new_target_critic, new_alpha, info = (
+-            self._update_fn(
+-                self.rng,
+-                self.actor,
+-                self.critic,
+-                self.target_critic,
+-                self.alpha,
+-                batch,
+-                self.discount,
+-                self.tau,
+-                self.target_entropy,
+-            )
++        (
++            new_rng,
++            new_actor,
++            new_critic,
++            new_target_critic,
++            new_alpha,
++            new_popart,
++            info,
++        ) = self._update_fn(
++            self.rng,
++            self.actor,
++            self.critic,
++            self.target_critic,
++            self.alpha,
++            self.popart_state,
++            batch,
++            self.discount,
++            self.tau,
++            self.target_entropy,
+         )
+ 
+         self.rng = new_rng
+@@ -271,6 +339,7 @@
+         self.critic = new_critic
+         self.target_critic = new_target_critic
+         self.alpha = new_alpha
++        self.popart_state = new_popart
+         self.models = {"alpha": self.alpha, "actor": self.actor, "critic": self.critic}
+ 
+         return info
+--- a/train_ars_lora.py
++++ b/train_ars_lora.py
+@@ -1,8 +1,8 @@
+ import os
+ import inspect
+ 
++import json
+ import uuid
+-import gym
+ import numpy as np
+ import tqdm
+ import math
+@@ -16,6 +16,15 @@
+ 
+ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+ 
++# Trainer-side checkpoint extras for the LoRA arm.  checkpoint_utils (shared
++# with train_ars.py, untouched) only serializes the BASE
++# actor/critic/target_critic/alpha models; the LoRA-phase state — attached
++# flag, attach-time scale, the lora_{actor,critic,target_critic} models and
++# the eval-success vector driving the reset-vs-attach decision — is written
++# by this trainer into the completed checkpoint dir as side files.
++LORA_META_NAME = "lora_meta.json"
++LORA_STATE_NAME = "lora_state.msgpack"
++
+ 
+ @dataclass
+ class Config:
+@@ -23,6 +32,12 @@
+-    project: str = "MTRL"
++    project: str = "toppo-repro"
+     group: str = ""
+     name: str = ""
++    # explicit wandb overrides — applied at the END of __post_init__ so they
++    # survive run_experiments.py re-calling __post_init__ after config_args
++    # (setting name=/group= directly via config_args is silently clobbered).
++    wandb_name: str = ""
++    wandb_group: str = ""
++    wandb_tags: str = ""  # comma-separated, e.g. "mt50,sac"
+     # model params
+     actor_lr: float = 3e-4
+     critic_lr: float = 3e-4
+@@ -35,29 +50,64 @@
+     critic_layernorm: bool = False
+     critic_init_layernorm: bool = False
+     dropout_rate: float = -1.0  # -1.0 means no dropout
+-    activation: str = "relu"
++    activation: str = "tanh"  # upstream defaulted to relu; its recipes pass tanh
+     rank: int = 16  # 8 for MT10, 16 for MT50
+-    # training params
++    # training params.  Defaults below = the paper's MT50 protocol, i.e.
++    # upstream's published MT50 recipe on Meta-World 3.0.0 with deterministic
++    # evaluation (upstream defaulted to n_reset=4, replay_buffer_size=1e6,
++    # domain="metaworld", env_name="MT10", eval_interval=1e4, "stc").  The
++    # launchers in slurm/ still pass every one of them explicitly.
+     batch_size: int = 100
+-    max_steps: int = int(2e6)
++    max_steps: int = int(2e6)  # loop iterations; on MT50 x 50 envs = 100M env steps
+     log_interval: int = 1000
+-    n_reset: int = 4
++    n_reset: int = 6
+     threshold: float = 0.65  # 0.8 for MT10, 0.65 for MT50
+-    replay_buffer_size: int = int(1e6)
++    replay_buffer_size: int = int(5e5)
+     initial_step: int = int(25e3)
+     n_train_per_step: int = 1
+     # env params
+-    domain: str = "metaworld"
+-    env_name: str = "MT10"
++    # metaworld3 = metaworld==3.0.0 / gymnasium, the TOPPO-paper env stack.
++    # "metaworld" (upstream's vendored mujoco_py-era copy) does not ship here.
++    domain: str = "metaworld3"
++    env_name: str = "MT50"
+     max_path_length: int = 500
++    rf_version: str = "v2"  # metaworld3 reward_function_version ctor kwarg
+     # evaluation params
+     eval_episodes: int = 1
+-    eval_interval: int = int(1e4)
++    eval_interval: int = 20000  # iterations; every 1M env steps on MT50
++    # "det" = deterministic policy mean (the TOPPO-paper protocol); "stc" =
++    # stochastic sampling (upstream ARS default).
++    eval_distribution: str = "det"
++    # metaworld3 only: evaluate one episode per benchmark goal (50/task) via
++    # set_tasks rounds of 10 parallel copies; False keeps the upstream
++    # first-10-goals scheme.
++    eval_all_goals: bool = True
++    # checkpoint / resume params (see checkpoint_utils.py)
++    #   checkpoint_dir: "" = auto  checkpoints/<sanitized group>/<name>_s<seed>
++    #     (relative to the CWD, i.e. this directory when launched normally)
++    #   checkpoint_interval: iterations between saves; 0 = auto (max_steps//10)
++    #   checkpoint_buffer: also persist the replay buffer (multi-GB but required
++    #     for a faithful resume — without it the restored agent trains on an
++    #     empty buffer and the ARS reward scale loses its history)
++    #   resume: "auto" = continue from <checkpoint_dir>/latest when present;
++    #           "never" = always start fresh; any other value = explicit path
++    #           to a checkpoint dir (the one containing meta.json)
++    checkpoint_dir: str = ""
++    checkpoint_interval: int = 0
++    checkpoint_buffer: bool = True
++    resume: str = "auto"
+     # general params
+     seed: int = 10
+     eval_seed: int = 42
+ 
+     def __post_init__(self):
++        if self.domain != "metaworld3":
++            # Fail here, before W&B or the env workers start.
++            raise ValueError(
++                f"domain={self.domain!r} is not supported: this release ships "
++                "only the Meta-World 3.0.0 backend (domain=metaworld3); "
++                "upstream's vendored Meta-World was removed (see PROVENANCE.md)."
++            )
+         self.group = f"{self.domain}-{self.env_name}(H={self.max_path_length})"
+         reset_interval = math.ceil(self.max_steps / (1000 * (self.n_reset + 1))) * 1000
+         if reset_interval % 1e5 == 0:
+@@ -71,37 +121,168 @@
+             alg_name += "-LN"
+ 
+         self.name = f"{alg_name}-NReset{self.n_reset}-Interval{r_interval}e5"
++        if self.wandb_group:
++            self.group = self.wandb_group
++        if self.wandb_name:
++            self.name = self.wandb_name
+ 
+ 
+-def main(config: Config):
+-    wandb.init(
+-        config=asdict(config),
+-        project=config.project,
+-        group=config.group,
+-        name=config.name,
+-        id=str(uuid.uuid4()),
+-    )
+-
++def setup_envs(config: Config):
+     envs, env_names, tasks = utils.make_benchmark(
+-        config.domain, config.env_name, config.seed, config.max_path_length
++        config.domain, config.env_name, config.seed, config.max_path_length,
++        rf_version=config.rf_version,
+     )
+     env_names = list(env_names)
+     env = utils.wrappers.MultiParallelEnvExecutor(envs)
+     action_dim = env.action_space.shape[0]
+     n_envs = env.n_envs
+ 
+-    eval_tasks = {
+-        env_name: tasks_per_env[:10] for env_name, tasks_per_env in tasks.items()
+-    }
++    eval_rounds = None
++    if config.domain == "metaworld3" and config.eval_all_goals:
++        # Paper protocol: one eval episode per benchmark goal (50/task),
++        # 10 parallel copies x 5 set_tasks rounds per eval.
++        import metaworld3_ars
++        eval_tasks = {name: list(goals) for name, goals in tasks.items()}
++        eval_rounds = metaworld3_ars.build_eval_rounds(eval_tasks, 10)
++    else:
++        eval_tasks = {
++            env_name: tasks_per_env[:10] for env_name, tasks_per_env in tasks.items()
++        }
+     eval_envs = utils.make_eval_benchmark(
+         config.domain,
+         config.env_name,
+         config.eval_seed,
+         eval_tasks,
+         config.max_path_length,
++        rf_version=config.rf_version,
+     )
+     eval_env = utils.wrappers.MultiParallelEnvExecutor(eval_envs, 10, eval_tasks)
+ 
++    return env, eval_env, env_names, action_dim, n_envs, eval_rounds
++
++
++def _config_fingerprint(config: Config) -> str:
++    """Stable hash of the training-relevant config (wandb/checkpoint fields
++    excluded) — guards against silently resuming with different physics."""
++    import hashlib
++
++    d = asdict(config)
++    for k in (
++        "project", "group", "name", "wandb_name", "wandb_group", "wandb_tags",
++        "checkpoint_dir", "checkpoint_interval", "checkpoint_buffer", "resume",
++    ):
++        d.pop(k, None)
++    blob = str(sorted(d.items())).encode()
++    return hashlib.sha256(blob).hexdigest()[:12]
++
++
++def _sanitize_path_component(s: str) -> str:
++    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in s)
++
++
++def _lora_state(agent):
++    """Serializable pytree of the LoRA-phase models — the counterpart of
++    checkpoint_utils._learner_state, which only covers the base models.  The
++    frozen base params baked into the LoRA module defs are NOT here: they are
++    re-extracted from the restored base actor/critic on resume, so they match
++    the original run exactly."""
++    return {
++        "lora_actor": {
++            "step": agent.lora_actor.step,
++            "params": agent.lora_actor.params,
++            "opt_state": agent.lora_actor.opt_state,
++        },
++        "lora_critic": {
++            "step": agent.lora_critic.step,
++            "params": agent.lora_critic.params,
++            "opt_state": agent.lora_critic.opt_state,
++        },
++        "lora_target_critic": {
++            "step": agent.lora_target_critic.step,
++            "params": agent.lora_target_critic.params,
++        },
++    }
++
++
++def main(config: Config):
++    import checkpoint_utils as ck
++
++    # Upstream never seeds np.random (replay-buffer sampling uses it), so
++    # sampling was irreproducible and run_experiments' sequential-seed loop
++    # leaked RNG state across seeds.  Seeding here changes no distribution.
++    np.random.seed(config.seed)
++
++    # Don't double the seed suffix when the caller already baked it into the
++    # run name (the canonical launchers pass wandb_name=..._s<seed>).
++    name_component = _sanitize_path_component(config.name)
++    if not name_component.endswith(f"_s{config.seed}"):
++        name_component = f"{name_component}_s{config.seed}"
++    ckpt_dir = config.checkpoint_dir or os.path.join(
++        "checkpoints", _sanitize_path_component(config.group), name_component,
++    )
++    ckpt_interval = config.checkpoint_interval or max(1, config.max_steps // 10)
++    fingerprint = _config_fingerprint(config)
++
++    def _check_meta(meta, path):
++        if meta["config_fingerprint"] != fingerprint:
++            raise ValueError(
++                f"checkpoint at {path} was written with a different "
++                f"training config (fingerprint {meta['config_fingerprint']} != "
++                f"{fingerprint}). Pass resume=never (or clear the checkpoint "
++                "dir) to start fresh, or restore the original config."
++            )
++        if meta["agent_initialized"] and not meta.get("buffer_saved", False):
++            raise ValueError(
++                f"checkpoint at {path} has a trained agent but NO replay "
++                "buffer (checkpoint_buffer=False). Resuming would silently "
++                "train on a near-empty buffer. Re-run with resume=never, or "
++                "keep checkpoint_buffer=True for resumable runs."
++            )
++        rev_then, rev_now = meta.get("git_rev", "unknown"), ck.current_git_rev()
++        if rev_then not in ("unknown", rev_now):
++            print(
++                f"[resume] WARNING: checkpoint written at git rev {rev_then}, "
++                f"current rev is {rev_now} — code drift is not fingerprinted; "
++                "make sure the training semantics are unchanged."
++            )
++
++    resume_candidates = []
++    if config.resume == "auto":
++        resume_candidates = ck.resumable_candidates(ckpt_dir)
++    elif config.resume != "never":
++        if not os.path.isfile(os.path.join(config.resume, ck.META_NAME)):
++            raise FileNotFoundError(f"resume={config.resume!r} has no {ck.META_NAME}")
++        resume_candidates = [config.resume]
++
++    meta = None
++    resume_path = None
++    if resume_candidates:
++        resume_path = resume_candidates[0]
++        meta = ck.load_meta(resume_path)
++        _check_meta(meta, resume_path)
++        print(
++            f"[resume] continuing from {resume_path} at iteration "
++            f"{meta['iteration']} (wandb run {meta['wandb_run_id']})"
++        )
++
++    run_id = meta["wandb_run_id"] if meta is not None else str(uuid.uuid4())
++    wandb.init(
++        config=asdict(config),
++        project=config.project,
++        group=config.group,
++        name=config.name,
++        tags=[t for t in config.wandb_tags.split(",") if t] or None,
++        id=run_id,
++        resume="allow",
++    )
++
++    env, eval_env, env_names, action_dim, n_envs, eval_rounds = setup_envs(config)
++    # n_envs = TOTAL env slots.  This trainer runs one copy per task, so
++    # gpu_k is always 1 and n_tasks == n_envs; the split is kept for
++    # structural parity with train_ars.py (learner / replay buffer / alpha /
++    # rew_scale are all per-TASK).
++    n_tasks = len(env_names)
++    gpu_k = n_envs // n_tasks
+     kwargs_ = asdict(config)
+     kwargs_["hidden_dims"] = tuple([config.hidden_dim for _ in range(config.n_layer)])
+     learner_args = inspect.signature(Learner).parameters.keys()
+@@ -113,32 +294,246 @@
+     replay_buffer = MultiTaskReplayBuffer(
+         env.observation_space,
+         action_dim,
+-        config.replay_buffer_size or config.max_steps,
+-        n_envs,
++        # 0/None = "hold the whole run" (gpu_k == 1 keeps the legacy fallback).
++        config.replay_buffer_size or config.max_steps * gpu_k,
++        n_tasks,
+     )
+ 
+     eval_returns = []
+-    eval_success = np.zeros(n_envs)
++    eval_success = np.zeros(n_tasks)
+     observations, dones = env.reset(), False
+-    rew_scale = np.ones((n_envs, 1))
++    rew_scale = np.ones((n_tasks, 1))
++    # rew_scale_base: refreshed at every pre-LoRA reset boundary; consumed by
++    # the attach branch (a post-attach re-attach reads the LAST pre-LoRA
++    # value, so it must survive a resume).  lora_scale: the attach-time
++    # rew_scale_base / rew_scale ratio baked into the LoRA module defs —
++    # needed to reconstruct them faithfully on resume.
++    rew_scale_base = None
++    lora_scale = None
+     success = np.zeros(n_envs)
+-
+     reset_interval = math.ceil(config.max_steps / (1000 * (config.n_reset + 1))) * 1000
+-    for i in tqdm.tqdm(range(1, config.max_steps + 1), smoothing=0.1, disable=False):
++
++    # --- resume: restore buffer, learner (+LoRA), ARS scale, RNG, iteration --
++    def _attach_and_restore_lora(agent_, lora_scale_, blob_path):
++        """Re-attach the LoRA modules with the checkpointed attach-time scale,
++        then overwrite their params/opt_state from the side blob.  The base
++        params baked into the LoRA module defs come from the already-restored
++        (frozen) base actor/critic, matching the original run exactly."""
++        import flax.serialization
++        import jax
++
++        saved_rng = agent_.rng  # init_LoRA_modules re-splits it; undo below
++        agent_.init_LoRA_modules(
++            observations=env.observation_space.sample()[np.newaxis],
++            actions=env.action_space.sample()[np.newaxis],
++            hidden_dims=kwargs_["hidden_dims"],
++            rank=config.rank,
++            alpha=1.0,
++            scale=lora_scale_,
++            actor_lr=kwargs_["actor_lr"],
++            critic_lr=kwargs_["critic_lr"],
++            n_critic=config.n_critic,
++            activation=config.activation,
++            critic_layernorm=config.critic_layernorm,
++            critic_init_layernorm=config.critic_init_layernorm,
++            softplus=True,
++        )
++        with open(blob_path, "rb") as f:
++            blob = f.read()
++        template = _lora_state(agent_)
++        state = flax.serialization.from_bytes(template, blob)
++        dev = jax.tree_util.tree_map(np.asarray, state)
++        agent_.lora_actor = agent_.lora_actor.replace(
++            step=int(dev["lora_actor"]["step"]),
++            params=dev["lora_actor"]["params"],
++            opt_state=dev["lora_actor"]["opt_state"],
++        )
++        agent_.lora_critic = agent_.lora_critic.replace(
++            step=int(dev["lora_critic"]["step"]),
++            params=dev["lora_critic"]["params"],
++            opt_state=dev["lora_critic"]["opt_state"],
++        )
++        agent_.lora_target_critic = agent_.lora_target_critic.replace(
++            step=int(dev["lora_target_critic"]["step"]),
++            params=dev["lora_target_critic"]["params"],
++        )
++        agent_.rng = saved_rng  # checkpointed post-attach rng, not a re-split
++        agent_.use_lora = True
++        agent_.models.update(
++            {
++                "alpha": agent_.alpha,
++                "lora_actor": agent_.lora_actor,
++                "lora_critic": agent_.lora_critic,
++            }
++        )
++        return agent_
++
++    def _restore_from(path, meta_):
++        side_path = os.path.join(path, LORA_META_NAME)
++        if not os.path.isfile(side_path):
++            # _save writes the side files right AFTER checkpoint_utils'
++            # atomic dir swap; a kill in that tiny window leaves a checkpoint
++            # that checkpoint_utils deems complete but that is torn for the
++            # LoRA arm — reject it so the caller falls back to prev.
++            raise FileNotFoundError(f"{path} has no {LORA_META_NAME}")
++        with open(side_path) as f:
++            side = json.load(f)
++        ck.load_buffer(path, replay_buffer, meta_)
++        restored_agent = None
++        if meta_["agent_initialized"]:
++            blob = ck.learner_blob(path)
++            if blob is None:
++                raise FileNotFoundError(
++                    f"{path} says agent_initialized but has no learner state"
++                )
++            restored_agent = Learner(
++                observations=env.observation_space.sample()[np.newaxis],
++                actions=env.action_space.sample()[np.newaxis],
++                n_task=n_tasks,
++                **kwargs,
++            )
++            restored_agent = ck.restore_learner(restored_agent, blob)
++            if side.get("lora_attached"):
++                lora_blob = os.path.join(path, LORA_STATE_NAME)
++                if not os.path.isfile(lora_blob):
++                    raise FileNotFoundError(
++                        f"{path} says lora_attached but has no {LORA_STATE_NAME}"
++                    )
++                restored_agent = _attach_and_restore_lora(
++                    restored_agent,
++                    np.asarray(side["lora_scale"], dtype=np.float32).reshape(
++                        n_tasks, 1
++                    ),
++                    lora_blob,
++                )
++        restored_scale = None
++        if meta_["rew_scale"] is not None:
++            # float32 matches the steady-state dtype (rew_scale is derived
++            # from float32 reward means once the agent initializes).
++            restored_scale = np.asarray(
++                meta_["rew_scale"], dtype=np.float32
++            ).reshape(n_tasks, 1)
++        ck.restore_np_random(meta_)
++        r_base = (
++            None
++            if side.get("rew_scale_base") is None
++            else np.asarray(side["rew_scale_base"], dtype=np.float32).reshape(
++                n_tasks, 1
++            )
++        )
++        r_lscale = (
++            None
++            if side.get("lora_scale") is None
++            else np.asarray(side["lora_scale"], dtype=np.float32).reshape(n_tasks, 1)
++        )
++        r_esucc = np.asarray(side["eval_success"], dtype=np.float64)
++        return (
++            restored_agent,
++            restored_scale,
++            r_base,
++            r_lscale,
++            r_esucc,
++            int(meta_["iteration"]) + 1,
++        )
++
++    start_i = 1
++    if meta is not None:
++        try:
++            r_agent, r_scale, r_base, r_lscale, r_esucc, start_i = _restore_from(
++                resume_path, meta
++            )
++        except Exception as e:
++            # latest passed the completeness check but failed to LOAD (e.g. a
++            # node crash truncated a file post-rename). Fall back to prev.
++            fallback = [c for c in resume_candidates[1:]]
++            if not fallback:
++                raise
++            print(f"[resume] WARNING: loading {resume_path} failed ({e}); "
++                  f"falling back to {fallback[0]}")
++            meta = ck.load_meta(fallback[0])
++            _check_meta(meta, fallback[0])
++            r_agent, r_scale, r_base, r_lscale, r_esucc, start_i = _restore_from(
++                fallback[0], meta
++            )
++        if r_agent is not None:
++            agent = r_agent
++        if r_scale is not None:
++            rew_scale = r_scale
++        rew_scale_base = r_base
++        lora_scale = r_lscale
++        eval_success = r_esucc
++        # The env sim state is not checkpointed: episodes restart from reset
++        # (same semantics as the PPO GPU path's resume).
++
++    if start_i > config.max_steps:
++        # Resubmitting a finished run: don't re-rotate the checkpoint or
++        # rewrite multi-GB state for byte-identical content.
++        print(f"[resume] run already complete ({config.max_steps} iterations); exiting.")
++        env.close()
++        eval_env.close()
++        wandb.finish()
++        return
++
++    def _save(i_now: int) -> None:
++        path = ck.save_checkpoint(
++            ckpt_dir,
++            iteration=i_now,
++            config_fingerprint=fingerprint,
++            wandb_run_id=run_id,
++            agent=agent,
++            replay_buffer=replay_buffer,
++            rew_scale=rew_scale,
++            save_buffer=config.checkpoint_buffer,
++        )
++        # LoRA-arm side files (checkpoint_utils has no extension point and
++        # stays untouched): written into the completed dir right after the
++        # atomic swap, BEFORE any offload.  _restore_from treats a missing
++        # lora_meta.json as a torn checkpoint and falls back to prev.
++        import flax.serialization
++        import jax
++
++        attached = agent is not None and agent.use_lora
++        side = {
++            "lora_attached": bool(attached),
++            "rew_scale_base": (
++                None if rew_scale_base is None else np.asarray(rew_scale_base).tolist()
++            ),
++            "lora_scale": (
++                None if lora_scale is None else np.asarray(lora_scale).tolist()
++            ),
++            "eval_success": np.asarray(eval_success, dtype=float).tolist(),
++        }
++        with open(os.path.join(path, LORA_META_NAME), "w") as f:
++            json.dump(side, f)
++        if attached:
++            host = jax.device_get(_lora_state(agent))
++            with open(os.path.join(path, LORA_STATE_NAME), "wb") as f:
++                f.write(flax.serialization.to_bytes(host))
++        print(f"[checkpoint] saved iteration {i_now} -> {path}")
++        if os.environ.get("CHECKPOINT_ASYNC", "0") not in {"1", "true", "True"}:
++            ck.offload_checkpoint(path)
++
++    for i in tqdm.tqdm(
++        range(start_i, config.max_steps + 1),
++        initial=start_i - 1,
++        total=config.max_steps,
++        smoothing=0.1,
++        disable=False,
++    ):
+         if i > config.initial_step:
+             if agent is None:
+                 mean_rews = np.mean(
+                     replay_buffer.rewards[:, : replay_buffer.size], axis=-1
+                 )
+                 rew_scale = np.reshape(
+-                    np.max(mean_rews) / np.maximum(mean_rews, 0.01), (n_envs, 1)
++                    np.max(mean_rews) / np.maximum(mean_rews, 0.01), (n_tasks, 1)
+                 )
++                utils.log_rew_scale(i, rew_scale, env_names, n_envs_total=n_envs)
+ 
+-                utils.log_rew_scale(i, rew_scale, env_names)
+                 agent = Learner(
+                     observations=env.observation_space.sample()[np.newaxis],
+                     actions=env.action_space.sample()[np.newaxis],
+-                    n_task=n_envs,
++                    n_task=n_tasks,
+                     **kwargs,
+                 )
+             actions = agent.sample_actions(np.array(observations), distribution="stc")
+@@ -158,26 +553,41 @@
+                 success[env_id] += info["success"]
+                 env_id += 1
+ 
+-        replay_buffer.insert(
+-            observations, actions, rewards, masks, dones_float, next_observations
+-        )
++        # Task-major slot layout: slot = task_id * gpu_k + copy (gpu_k == 1
++        # here, so this is exactly the legacy single insert).
++        obs_a = np.asarray(observations)
++        next_a = np.asarray(next_observations)
++        act_a = np.asarray(actions)
++        rew_a = np.asarray(rewards, dtype=np.float32)
++        mask_a = np.asarray(masks, dtype=np.float32)
++        df_a = np.asarray(dones_float, dtype=np.float32)
++        base = np.arange(n_tasks) * gpu_k
++        for c in range(gpu_k):
++            sl = base + c
++            replay_buffer.insert(
++                obs_a[sl], act_a[sl], rew_a[sl], mask_a[sl], df_a[sl], next_a[sl]
++            )
+ 
+         observations = next_observations
+ 
+         if all(dones):
+             observations, dones = env.reset(), False
+             if i % config.log_interval:
+-                utils.log_episode_info(i, infos, env_names, config.env_name, success)
+-
++                utils.log_episode_info(
++                    i, infos, env_names, config.env_name, success,
++                    n_envs_total=n_envs,
++                )
+             success = np.zeros(n_envs)
+ 
+-        if i > config.batch_size and i > config.initial_step:
++        if i * gpu_k > config.batch_size and i > config.initial_step:
+             for _ in range(config.n_train_per_step):
+                 batch = replay_buffer.sample(config.batch_size, rew_scale=rew_scale)
+                 update_info = agent.update(batch)
+ 
+             if i % config.log_interval == 0:
+-                utils.log_update_metrics(i, update_info, env_names)
++                utils.log_update_metrics(
++                    i, update_info, env_names, n_envs_total=n_envs
++                )
+ 
+         if i % config.eval_interval == 0 and i > config.initial_step:
+             eval_returns_, eval_success = utils.run_eval(
+@@ -185,9 +595,14 @@
+                 agent,
+                 eval_env,
+                 config.eval_episodes,
+-                n_envs,
++                # tasks, not slots: evaluate_n_envs keeps one stat bucket per
++                # task and derives copies-per-task from len(obs)//n_envs
++                n_tasks,
+                 env_names,
+                 config.env_name,
++                n_envs_total=n_envs,
++                distribution=config.eval_distribution,
++                tasks=eval_rounds,
+             )
+             eval_returns.append((i, *eval_returns_))
+ 
+@@ -196,26 +611,27 @@
+                 rew_scale_base = rew_scale.copy()
+             mean_rews = np.mean(replay_buffer.rewards[:, : replay_buffer.size], axis=-1)
+             rew_scale = np.reshape(
+-                np.max(mean_rews) / np.maximum(mean_rews, 0.01), (n_envs, 1)
++                np.max(mean_rews) / np.maximum(mean_rews, 0.01), (n_tasks, 1)
+             )
+-            utils.log_rew_scale(i, rew_scale, env_names)
++            utils.log_rew_scale(i, rew_scale, env_names, n_envs_total=n_envs)
+             if (
+                 np.mean(eval_success) < config.threshold and not agent.use_lora
+             ) or i <= config.max_steps * 0.75:
+                 agent = Learner(
+                     observations=env.observation_space.sample()[np.newaxis],
+                     actions=env.action_space.sample()[np.newaxis],
+-                    n_task=n_envs,
++                    n_task=n_tasks,
+                     **kwargs,
+                 )
+             else:
++                lora_scale = rew_scale_base / rew_scale
+                 agent.init_LoRA_modules(
+                     observations=env.observation_space.sample()[np.newaxis],
+                     actions=env.action_space.sample()[np.newaxis],
+                     hidden_dims=kwargs_["hidden_dims"],
+                     rank=config.rank,
+                     alpha=1.0,
+-                    scale=rew_scale_base / rew_scale,
++                    scale=lora_scale,
+                     actor_lr=kwargs_["actor_lr"],
+                     critic_lr=kwargs_["critic_lr"],
+                     n_critic=config.n_critic,
+@@ -229,6 +645,14 @@
+             for _ in range(int(1e3)):
+                 batch = replay_buffer.sample(config.batch_size, rew_scale=rew_scale)
+                 update_info = agent.update(batch)
++
++        # Periodic checkpoint — last block of the iteration so the saved
++        # state reflects a fully completed iteration (incl. any ARS reset
++        # or LoRA attach).
++        if i % ckpt_interval == 0 and i < config.max_steps:
++            _save(i)
++
++    _save(config.max_steps)
+     env.close()
+     eval_env.close()
+     wandb.finish()
+@@ -236,4 +660,4 @@
+ 
+ if __name__ == "__main__":
+     config = pyrallis.parse(Config)
+-    main()
++    main(config)
+--- a/train_ars.py
++++ b/train_ars.py
+@@ -9,7 +9,6 @@
+ import wandb
+ from dataclasses import dataclass, asdict
+ 
+-from learner_sac_mt import Learner
+ from dataset_utils import MultiTaskReplayBuffer
+ import utils
+ 
+@@ -22,6 +21,12 @@
+-    project: str = "MTRL"
++    project: str = "toppo-repro"
+     group: str = ""
+     name: str = ""
++    # explicit wandb overrides — applied at the END of __post_init__ so they
++    # survive run_experiments.py re-calling __post_init__ after config_args
++    # (setting name=/group= directly via config_args is silently clobbered).
++    wandb_name: str = ""
++    wandb_group: str = ""
++    wandb_tags: str = ""  # comma-separated, e.g. "mt50,baseline"
+     # model params
+     actor_lr: float = 3e-4
+     critic_lr: float = 3e-4
+@@ -37,27 +42,74 @@
+     activation: str = "tanh"
+     multi_head: bool = False
+     use_pcgrad: bool = False
+-    # training params
++    # critic balancing (TOPPO critic stack in SAC) — forwarded to the Learner.
++    # The full CB arm = critic_method=fairgrad + use_popart=True +
++    # critic_layernorm=True (LN-c); actor_method=pcgrad adds the paper's
++    # actor-side PCGrad.
++    actor_method: str = "default"   # default | pcgrad
++    critic_method: str = "default"  # default | pcgrad | fairgrad (FG-c, alpha=1)
++    fairgrad_critic_alpha: float = 1.0
++    use_popart: bool = False
++    popart_method: str = "ema"      # ema (Hessel beta=3e-4) | welford (paper)
++    popart_ema_decay: float = 3e-4
++    popart_min_std: float = 1e-2
++    # training params.  Defaults below = the paper's MT50 protocol, i.e.
++    # upstream's published MT50 recipe on Meta-World 3.0.0 with deterministic
++    # evaluation (upstream defaulted to n_reset=4, replay_buffer_size=1e6,
++    # domain="metaworld", env_name="MT10", eval_interval=1e4, "stc").  The
++    # launchers in slurm/ still pass every one of them explicitly.
+     use_ars: bool = True
+     batch_size: int = 100
+-    max_steps: int = int(2e6)
++    max_steps: int = int(2e6)  # loop iterations; on MT50 x 50 envs = 100M env steps
+     log_interval: int = 1000
+-    n_reset: int = 4
+-    replay_buffer_size: int = int(1e6)
++    n_reset: int = 6
++    replay_buffer_size: int = int(5e5)
+     initial_step: int = int(25e3)
+     n_train_per_step: int = 1
+     # env params
+-    domain: str = "metaworld"
+-    env_name: str = "MT10"
++    # metaworld3 = metaworld==3.0.0 / gymnasium, the TOPPO-paper env stack.
++    # "metaworld" (upstream's vendored mujoco_py-era copy) does not ship here.
++    domain: str = "metaworld3"
++    env_name: str = "MT50"
+     max_path_length: int = 500
++    rf_version: str = "v2"  # metaworld3 reward_function_version ctor kwarg
+     # evaluation params
+     eval_episodes: int = 1
+-    eval_interval: int = int(1e4)
++    eval_interval: int = 20000  # iterations; every 1M env steps on MT50
++    # "det" = deterministic policy mean (the TOPPO-paper protocol); "stc" =
++    # stochastic sampling (upstream ARS default).
++    eval_distribution: str = "det"
++    # metaworld3 only: evaluate one episode per benchmark goal (50/task) via
++    # set_tasks rounds of 10 parallel copies; False keeps the upstream
++    # first-10-goals scheme.
++    eval_all_goals: bool = True
++    eval_copies_per_task: int = 10
++    # checkpoint / resume params (see checkpoint_utils.py)
++    #   checkpoint_dir: "" = auto  checkpoints/<sanitized group>/<name>_s<seed>
++    #     (relative to the CWD, i.e. this directory when launched normally)
++    #   checkpoint_interval: iterations between saves; 0 = auto (max_steps//10)
++    #   checkpoint_buffer: also persist the replay buffer (multi-GB but required
++    #     for a faithful resume — without it the restored agent trains on an
++    #     empty buffer and the ARS reward scale loses its history)
++    #   resume: "auto" = continue from <checkpoint_dir>/latest when present;
++    #           "never" = always start fresh; any other value = explicit path
++    #           to a checkpoint dir (the one containing meta.json)
++    checkpoint_dir: str = ""
++    checkpoint_interval: int = 0
++    checkpoint_buffer: bool = True
++    resume: str = "auto"
+     # general params
+     seed: int = 10
+     eval_seed: int = 42
+ 
+     def __post_init__(self):
++        if self.domain != "metaworld3":
++            # Fail here, before W&B or the env workers start.
++            raise ValueError(
++                f"domain={self.domain!r} is not supported: this release ships "
++                "only the Meta-World 3.0.0 backend (domain=metaworld3); "
++                "upstream's vendored Meta-World was removed (see PROVENANCE.md)."
++            )
+         self.group = f"{self.domain}-{self.env_name}(H={self.max_path_length})"
+         reset_interval = math.ceil(self.max_steps / (1000 * (self.n_reset + 1))) * 1000
+         if reset_interval % 1e5 == 0:
+@@ -75,48 +127,170 @@
+             alg_name += "-LN-ILN"
+         elif self.critic_layernorm:
+             alg_name += "-LN"
++        if self.critic_method == "fairgrad":
++            alg_name += "-FGc"
++        elif self.critic_method == "pcgrad" and not self.use_pcgrad:
++            alg_name += "-PCGc"
++        if self.actor_method == "pcgrad" and not self.use_pcgrad:
++            alg_name += "-PCGa"
++        if self.use_popart:
++            alg_name += "-PopArt"
+ 
+         self.name = (
+             f"{alg_name}-NReset{self.n_reset}-Interval{r_interval}e5"
+             if self.use_ars
+             else f"{alg_name}"
+         )
++        if self.wandb_group:
++            self.group = self.wandb_group
++        if self.wandb_name:
++            self.name = self.wandb_name
+ 
+ 
+ def setup_envs(config: Config):
+     envs, env_names, tasks = utils.make_benchmark(
+-        config.domain, config.env_name, config.seed, config.max_path_length
++        config.domain, config.env_name, config.seed, config.max_path_length,
++        rf_version=config.rf_version,
+     )
+     env_names = list(env_names)
+     env = utils.wrappers.MultiParallelEnvExecutor(envs)
+     action_dim = env.action_space.shape[0]
+     n_envs = env.n_envs
+ 
+-    eval_tasks = {
+-        env_name: tasks_per_env[:10] for env_name, tasks_per_env in tasks.items()
+-    }
++    eval_rounds = None
++    if config.domain == "metaworld3" and config.eval_all_goals:
++        # Paper protocol: one eval episode per benchmark goal (50/task),
++        # 10 parallel copies x 5 set_tasks rounds per eval.
++        import metaworld3_ars
++        eval_tasks = {name: list(goals) for name, goals in tasks.items()}
++        eval_rounds = metaworld3_ars.build_eval_rounds(eval_tasks, config.eval_copies_per_task)
++    else:
++        eval_tasks = {
++            env_name: tasks_per_env[:10] for env_name, tasks_per_env in tasks.items()
++        }
+     eval_envs = utils.make_eval_benchmark(
+         config.domain,
+         config.env_name,
+         config.eval_seed,
+         eval_tasks,
+         config.max_path_length,
++        rf_version=config.rf_version,
+     )
+-    eval_env = utils.wrappers.MultiParallelEnvExecutor(eval_envs, 10, eval_tasks)
++    eval_env = utils.wrappers.MultiParallelEnvExecutor(eval_envs, config.eval_copies_per_task, eval_tasks)
++
++    return env, eval_env, env_names, action_dim, n_envs, eval_rounds
++
++
++def _config_fingerprint(config: Config) -> str:
++    """Stable hash of the training-relevant config (wandb/checkpoint fields
++    excluded) — guards against silently resuming with different physics."""
++    import hashlib
+ 
+-    return env, eval_env, env_names, action_dim, n_envs
++    d = asdict(config)
++    for k in (
++        "project", "group", "name", "wandb_name", "wandb_group", "wandb_tags",
++        "checkpoint_dir", "checkpoint_interval", "checkpoint_buffer", "resume",
++    ):
++        d.pop(k, None)
++    blob = str(sorted(d.items())).encode()
++    return hashlib.sha256(blob).hexdigest()[:12]
++
++
++def _sanitize_path_component(s: str) -> str:
++    return "".join(c if (c.isalnum() or c in "-_.") else "_" for c in s)
+ 
+ 
+ def main(config: Config):
++    # Fork MetaWorld workers before importing JAX/Flax or starting W&B.
++    # Forking after JAX creates its thread pools can deadlock in child workers.
++    env, eval_env, env_names, action_dim, n_envs, eval_rounds = setup_envs(config)
++
++    from learner_sac_mt import Learner
++    import checkpoint_utils as ck
++
++    # Upstream never seeds np.random (replay-buffer sampling uses it), so
++    # sampling was irreproducible and run_experiments' sequential-seed loop
++    # leaked RNG state across seeds.  Seeding here changes no distribution.
++    np.random.seed(config.seed)
++
++    # Don't double the seed suffix when the caller already baked it into the
++    # run name (the canonical launchers pass wandb_name=..._s<seed>).
++    name_component = _sanitize_path_component(config.name)
++    if not name_component.endswith(f"_s{config.seed}"):
++        name_component = f"{name_component}_s{config.seed}"
++    ckpt_dir = config.checkpoint_dir or os.path.join(
++        "checkpoints", _sanitize_path_component(config.group), name_component,
++    )
++    ckpt_interval = config.checkpoint_interval or max(1, config.max_steps // 10)
++    fingerprint = _config_fingerprint(config)
++
++    def _check_meta(meta, path):
++        if meta["config_fingerprint"] != fingerprint:
++            raise ValueError(
++                f"checkpoint at {path} was written with a different "
++                f"training config (fingerprint {meta['config_fingerprint']} != "
++                f"{fingerprint}). Pass resume=never (or clear the checkpoint "
++                "dir) to start fresh, or restore the original config."
++            )
++        if meta["agent_initialized"] and not meta.get("buffer_saved", False):
++            raise ValueError(
++                f"checkpoint at {path} has a trained agent but NO replay "
++                "buffer (checkpoint_buffer=False). Resuming would silently "
++                "train on a near-empty buffer. Re-run with resume=never, or "
++                "keep checkpoint_buffer=True for resumable runs."
++            )
++        rev_then, rev_now = meta.get("git_rev", "unknown"), ck.current_git_rev()
++        if rev_then not in ("unknown", rev_now):
++            print(
++                f"[resume] WARNING: checkpoint written at git rev {rev_then}, "
++                f"current rev is {rev_now} — code drift is not fingerprinted; "
++                "make sure the training semantics are unchanged."
++            )
++
++    resume_candidates = []
++    if config.resume == "auto":
++        resume_candidates = ck.resumable_candidates(ckpt_dir)
++    elif config.resume != "never":
++        if not os.path.isfile(os.path.join(config.resume, ck.META_NAME)):
++            raise FileNotFoundError(f"resume={config.resume!r} has no {ck.META_NAME}")
++        resume_candidates = [config.resume]
++
++    meta = None
++    resume_path = None
++    if resume_candidates:
++        resume_path = resume_candidates[0]
++        meta = ck.load_meta(resume_path)
++        _check_meta(meta, resume_path)
++        print(
++            f"[resume] continuing from {resume_path} at iteration "
++            f"{meta['iteration']} (wandb run {meta['wandb_run_id']})"
++        )
++
++    run_id = meta["wandb_run_id"] if meta is not None else str(uuid.uuid4())
+     wandb.init(
+         config=asdict(config),
+         project=config.project,
+         group=config.group,
+         name=config.name,
+-        id=str(uuid.uuid4()),
++        tags=[t for t in config.wandb_tags.split(",") if t] or None,
++        id=run_id,
++        resume="allow",
+     )
+ 
+-    env, eval_env, env_names, action_dim, n_envs = setup_envs(config)
++    # n_envs = TOTAL env slots; an executor with gpu_k parallel copies per
++    # task lays them out task-major.  The learner / replay buffer / alpha /
++    # rew_scale all stay per-TASK (n_task = n_tasks).  The shipped Meta-World
++    # executor runs one copy per task (gpu_k == 1): upstream's path exactly.
++    n_tasks = len(env_names)
++    gpu_k = n_envs // n_tasks
++    if gpu_k > 1 and config.multi_head:
++        raise ValueError(
++            "More than one parallel copy per task (gpu_k > 1) with "
++            "multi_head=True is unsupported: sample_actions receives flat "
++            "(n_tasks*K, obs) collection batches and the multi-head policy "
++            "routes heads by axis-0 index, so task-major slots would silently "
++            "use the wrong heads. Use multi_head=False, or one copy per task."
++        )
+     kwargs_ = asdict(config)
+     kwargs_["hidden_dims"] = tuple([config.hidden_dim for _ in range(config.n_layer)])
+     kwargs_["multi_head"] = config.multi_head
+@@ -127,12 +301,15 @@
+     replay_buffer = MultiTaskReplayBuffer(
+         env.observation_space,
+         action_dim,
+-        config.replay_buffer_size or config.max_steps,
+-        n_envs,
++        # 0/None = "hold the whole run": each iteration inserts gpu_k columns
++        # per task, so the no-wrap capacity is max_steps * gpu_k (gpu_k == 1
++        # on the CPU path, reducing to the legacy fallback exactly).
++        config.replay_buffer_size or config.max_steps * gpu_k,
++        n_tasks,
+     )
+ 
+     observations, dones = env.reset(), False
+-    rew_scale = np.ones((n_envs, 1)) if config.use_ars else None
++    rew_scale = np.ones((n_tasks, 1)) if config.use_ars else None
+     success = np.zeros(n_envs)
+     reset_interval = (
+         math.ceil(config.max_steps / (1000 * (config.n_reset + 1))) * 1000
+@@ -140,7 +317,86 @@
+         else config.max_steps + 1
+     )
+ 
+-    for i in tqdm.tqdm(range(1, config.max_steps + 1), smoothing=0.1, disable=False):
++    # --- resume: restore buffer, learner, ARS scale, RNG, iteration ---------
++    def _restore_from(path, meta_):
++        ck.load_buffer(path, replay_buffer, meta_)
++        restored_agent = None
++        if meta_["agent_initialized"]:
++            blob = ck.learner_blob(path)
++            if blob is None:
++                raise FileNotFoundError(
++                    f"{path} says agent_initialized but has no learner state"
++                )
++            restored_agent = Learner(
++                observations=env.observation_space.sample()[np.newaxis],
++                actions=env.action_space.sample()[np.newaxis],
++                n_task=n_tasks,
++                **kwargs,
++            )
++            restored_agent = ck.restore_learner(restored_agent, blob)
++        restored_scale = None
++        if config.use_ars and meta_["rew_scale"] is not None:
++            # float32 matches the steady-state dtype (rew_scale is derived
++            # from float32 reward means once the agent initializes).
++            restored_scale = np.asarray(
++                meta_["rew_scale"], dtype=np.float32
++            ).reshape(n_tasks, 1)
++        ck.restore_np_random(meta_)
++        return restored_agent, restored_scale, int(meta_["iteration"]) + 1
++
++    start_i = 1
++    if meta is not None:
++        try:
++            r_agent, r_scale, start_i = _restore_from(resume_path, meta)
++        except Exception as e:
++            # latest passed the completeness check but failed to LOAD (e.g. a
++            # node crash truncated a file post-rename). Fall back to prev.
++            fallback = [c for c in resume_candidates[1:]]
++            if not fallback:
++                raise
++            print(f"[resume] WARNING: loading {resume_path} failed ({e}); "
++                  f"falling back to {fallback[0]}")
++            meta = ck.load_meta(fallback[0])
++            _check_meta(meta, fallback[0])
++            r_agent, r_scale, start_i = _restore_from(fallback[0], meta)
++        if r_agent is not None:
++            agent = r_agent
++        if r_scale is not None:
++            rew_scale = r_scale
++        # The env sim state is not checkpointed: episodes restart from reset
++        # (same semantics as the PPO GPU path's resume).
++
++    if start_i > config.max_steps:
++        # Resubmitting a finished run: don't re-rotate the checkpoint or
++        # rewrite multi-GB state for byte-identical content.
++        print(f"[resume] run already complete ({config.max_steps} iterations); exiting.")
++        env.close()
++        eval_env.close()
++        wandb.finish()
++        return
++
++    def _save(i_now: int) -> None:
++        path = ck.save_checkpoint(
++            ckpt_dir,
++            iteration=i_now,
++            config_fingerprint=fingerprint,
++            wandb_run_id=run_id,
++            agent=agent,
++            replay_buffer=replay_buffer,
++            rew_scale=rew_scale if config.use_ars else None,
++            save_buffer=config.checkpoint_buffer,
++        )
++        print(f"[checkpoint] saved iteration {i_now} -> {path}")
++        if os.environ.get("CHECKPOINT_ASYNC", "0") not in {"1", "true", "True"}:
++            ck.offload_checkpoint(path)
++
++    for i in tqdm.tqdm(
++        range(start_i, config.max_steps + 1),
++        initial=start_i - 1,
++        total=config.max_steps,
++        smoothing=0.1,
++        disable=False,
++    ):
+         if i > config.initial_step:
+             if agent is None:
+                 if config.use_ars:
+@@ -148,14 +404,14 @@
+                         replay_buffer.rewards[:, : replay_buffer.size], axis=-1
+                     )
+                     rew_scale = np.reshape(
+-                        np.max(mean_rews) / np.maximum(mean_rews, 0.01), (n_envs, 1)
++                        np.max(mean_rews) / np.maximum(mean_rews, 0.01), (n_tasks, 1)
+                     )
+-                    utils.log_rew_scale(i, rew_scale, env_names)
++                    utils.log_rew_scale(i, rew_scale, env_names, n_envs_total=n_envs)
+ 
+                 agent = Learner(
+                     observations=env.observation_space.sample()[np.newaxis],
+                     actions=env.action_space.sample()[np.newaxis],
+-                    n_task=n_envs,
++                    n_task=n_tasks,
+                     **kwargs,
+                 )
+             actions = agent.sample_actions(np.array(observations), distribution="stc")
+@@ -175,26 +431,47 @@
+                 success[env_id] += info["success"]
+                 env_id += 1
+ 
+-        replay_buffer.insert(
+-            observations, actions, rewards, masks, dones_float, next_observations
+-        )
++        # Task-major slot layout: slot = task_id * gpu_k + copy.  One insert
++        # per copy keeps the buffer's per-task rows (gpu_k == 1 -> identical
++        # to the legacy single insert).
++        obs_a = np.asarray(observations)
++        next_a = np.asarray(next_observations)
++        act_a = np.asarray(actions)
++        rew_a = np.asarray(rewards, dtype=np.float32)
++        mask_a = np.asarray(masks, dtype=np.float32)
++        df_a = np.asarray(dones_float, dtype=np.float32)
++        base = np.arange(n_tasks) * gpu_k
++        for c in range(gpu_k):
++            sl = base + c
++            replay_buffer.insert(
++                obs_a[sl], act_a[sl], rew_a[sl], mask_a[sl], df_a[sl], next_a[sl]
++            )
+ 
+         observations = next_observations
+ 
+         if all(dones):
+             observations, dones = env.reset(), False
+             if i % config.log_interval:
+-                utils.log_episode_info(i, infos, env_names, config.env_name, success)
++                utils.log_episode_info(
++                    i, infos, env_names, config.env_name, success,
++                    n_envs_total=n_envs,
++                )
+             success = np.zeros(n_envs)
+ 
+-        if i > config.batch_size and i > config.initial_step:
++        # Gate on collected samples PER TASK (i * gpu_k), not iterations:
++        # with K env copies per task the buffer reaches batch_size after
++        # batch_size/K iterations, and initial_step keeps its documented
++        # learning-starts meaning.  gpu_k == 1 reproduces the legacy gate.
++        if i * gpu_k > config.batch_size and i > config.initial_step:
+             sample_kwargs = {"rew_scale": rew_scale} if config.use_ars else {}
+             for _ in range(config.n_train_per_step):
+                 batch = replay_buffer.sample(config.batch_size, **sample_kwargs)
+                 update_info = agent.update(batch)
+ 
+             if i % config.log_interval == 0:
+-                utils.log_update_metrics(i, update_info, env_names)
++                utils.log_update_metrics(
++                    i, update_info, env_names, n_envs_total=n_envs
++                )
+ 
+         if i % config.eval_interval == 0 and i > config.initial_step:
+             utils.run_eval(
+@@ -202,26 +479,38 @@
+                 agent,
+                 eval_env,
+                 config.eval_episodes,
+-                n_envs,
++                # tasks, not slots: evaluate_n_envs keeps one stat bucket per
++                # task and derives copies-per-task from len(obs)//n_envs
++                n_tasks,
+                 env_names,
+                 config.env_name,
++                n_envs_total=n_envs,
++                distribution=config.eval_distribution,
++                tasks=eval_rounds,
+             )
+ 
+         if config.use_ars and i % reset_interval == 0 and i > config.batch_size:
+             mean_rews = np.mean(replay_buffer.rewards[:, : replay_buffer.size], axis=-1)
+             rew_scale = np.reshape(
+-                np.max(mean_rews) / np.maximum(mean_rews, 0.01), (n_envs, 1)
++                np.max(mean_rews) / np.maximum(mean_rews, 0.01), (n_tasks, 1)
+             )
+-            utils.log_rew_scale(i, rew_scale, env_names)
++            utils.log_rew_scale(i, rew_scale, env_names, n_envs_total=n_envs)
+             agent = Learner(
+                 observations=env.observation_space.sample()[np.newaxis],
+                 actions=env.action_space.sample()[np.newaxis],
+-                n_task=n_envs,
++                n_task=n_tasks,
+                 **kwargs,
+             )
+             for _ in range(int(1e3)):
+                 batch = replay_buffer.sample(config.batch_size, rew_scale=rew_scale)
+                 update_info = agent.update(batch)
++
++        # Periodic checkpoint — last block of the iteration so the saved
++        # state reflects a fully completed iteration (incl. any ARS reset).
++        if i % ckpt_interval == 0 and i < config.max_steps:
++            _save(i)
++
++    _save(config.max_steps)
+     env.close()
+     eval_env.close()
+     wandb.finish()
+@@ -229,4 +518,4 @@
+ 
+ if __name__ == "__main__":
+     config = pyrallis.parse(Config)
+-    main()
++    main(config)
+--- a/utils.py
++++ b/utils.py
+@@ -3,7 +3,7 @@
+ 
+ import numpy as np
+ import wandb
+-import gym
++import gymnasium as gym  # type hints only; the old-gym paths import lazily
+ 
+ # Prefer the local metaworld package in this repo over any installed version.
+ _REPO_ROOT = Path(__file__).resolve().parent
+@@ -11,31 +11,98 @@
+ if _LOCAL_METAWORLD.exists():
+     sys.path.insert(0, str(_REPO_ROOT))
+ 
+-import metaworld
++# NOTE: metaworld is imported lazily inside the metaworld branch of
++# make_benchmark/make_eval_benchmark so an unused backend does not pull
++# in mujoco_py (which requires MUJOCO_PY_MUJOCO_PATH / mujoco210 on the path).
+ 
+ import wrappers
+-from evaluation import evaluate_n_envs, evaluates
+ 
+ 
+-def log_rew_scale(step, rew_scale, env_names):
++def _env_step(step, env_names, n_envs_total=None):
++    """mtrl-aligned wandb x-axis: TOTAL env interactions across all envs.
++
++    One training-loop iteration steps every env slot once, so
++    env_step = step * n_envs_total (defaults to len(env_names) — one env per
++    task, the shipped executor's case).  This matches the PPO side's x-axis
++    (``env_step`` = total interactions across all N parallel envs), so SAC
++    and PPO curves overlay directly in wandb.  Passed as the
++    explicit ``wandb.log(step=...)`` (all call sites are monotonic in the
++    loop iteration); the legacy "time step" key (= per-env step) is kept for
++    old panels.
++    """
++    return int(step) * int(n_envs_total or len(env_names))
++
++
++def log_rew_scale(step, rew_scale, env_names, n_envs_total=None):
++    es = _env_step(step, env_names, n_envs_total)
+     wandb.log(
+         {
+             "time step": step,
++            "env_step": es,
+             **{
+                 f"{env_name}/training/rew_scale": np.mean(rew_scale[env_id])
+                 for env_id, env_name in enumerate(env_names)
+             },
+-        }
++        },
++        step=es,
+     )
+ 
+ 
+-def log_episode_info(step, infos, env_names, env_name, success):
++def log_episode_info(step, infos, env_names, env_name, success, n_envs_total=None):
++    es = _env_step(step, env_names, n_envs_total)
+     wandb.log(
+         {
+             "time step": step,
++            "env_step": es,
+             f"{env_name}/training/average_successs": np.mean(success > 0),
+-        }
++            # mtrl-aligned TRAINING-rollout keys (success-once per training
++            # episode; PPO's rollout scope) — eval keys live in run_eval.
++            "rollout/mean_win_rate": float(np.mean(success > 0)),
++            **(
++                {
++                    f"win_rate/{name}": float(success[i] > 0)
++                    for i, name in enumerate(env_names)
++                }
++                if len(infos) == len(env_names)
++                else {}
++            ),
++        },
++        step=es,
+     )
++    k = len(infos) // len(env_names)
++    if k > 1:
++        # Executor with k copies per task (task-major slots; unused by the
++        # shipped Meta-World executor, which runs one copy per task).
++        # Aggregate each task's k copies (episode stats -> mean over copies
++        # that finished; success -> fraction of copies with success-once).
++        for tid, name in enumerate(env_names):
++            block = infos[tid * k:(tid + 1) * k]
++            eps = [inf["episode"] for inf in block if "episode" in inf]
++            if eps:
++                wandb.log(
++                    {
++                        "time step": step,
++                        **{
++                            f"{name}/training/average_{kk}s": float(
++                                np.mean([ep[kk] for ep in eps])
++                            )
++                            for kk in eps[0]
++                            if kk not in ("length", "duration")
++                        },
++                    },
++                    step=es,
++                )
++            if any("success" in inf for inf in block):
++                wandb.log(
++                    {
++                        "time step": step,
++                        f"{name}/training/average_success": float(
++                            np.mean(np.asarray(success[tid * k:(tid + 1) * k]) > 0)
++                        ),
++                    },
++                    step=es,
++                )
++        return
+     for env_id, info in enumerate(infos):
+         for key, val in info.items():
+             if key == "episode":
+@@ -48,7 +115,8 @@
+                             f"{env_names[env_id]}/training/average_{k}s": v
+                             for k, v in val.items()
+                         },
+-                    }
++                    },
++                    step=es,
+                 )
+             elif key == "success":
+                 wandb.log(
+@@ -57,14 +125,16 @@
+                         f"{env_names[env_id]}/training/average_success": int(
+                             success[env_id] > 0
+                         ),
+-                    }
++                    },
++                    step=es,
+                 )
+ 
+ 
+-def log_update_metrics(step, update_info, env_names):
++def log_update_metrics(step, update_info, env_names, n_envs_total=None):
++    es = _env_step(step, env_names, n_envs_total)
+     for k, v in update_info.items():
+         if v.ndim == 0:
+-            wandb.log({"time step": step, f"training/{k}": v})
++            wandb.log({"time step": step, "env_step": es, f"training/{k}": v}, step=es)
+         else:
+             wandb.log(
+                 {
+@@ -73,29 +143,56 @@
+                         f"{env_name}/training/{k}": vv
+                         for env_name, vv in zip(env_names, v)
+                     },
+-                }
++                },
++                step=es,
+             )
+ 
+ 
+-def run_eval(step, agent, eval_env, eval_episodes, n_envs, env_names, env_name):
++def run_eval(step, agent, eval_env, eval_episodes, n_envs, env_names, env_name,
++             n_envs_total=None, distribution="stc", tasks=None):
++    from evaluation import evaluate_n_envs, evaluates
++    # tasks: optional list of set_tasks rounds (metaworld3 50-goal protocol —
++    # see metaworld3_ars.build_eval_rounds); when given, evaluate_n_envs runs
++    # one episode per round and eval_episodes is ignored.
+     eval_stats = evaluates(
+         eval_f=evaluate_n_envs,
+         agent=agent,
+         env=eval_env,
+         num_episodes=eval_episodes,
+         n_envs=n_envs,
+-        distribution="stc",
++        distribution=distribution,
++        tasks=tasks,
+     )
+     eval_returns = [eval_stat["return"] for eval_stat in eval_stats]
+     if "success" in eval_stats[0].keys():
+         eval_success = [eval_stat["success"] for eval_stat in eval_stats]
+     else:
+         eval_success = [0 for _ in range(n_envs)]
++    es = _env_step(step, env_names, n_envs_total)
+     wandb.log(
+         {
+             "time step": step,
++            "env_step": es,
++            # legacy key (kept so old panels/queries keep working)
+             f"{env_name}/evaluation/average_successs": np.mean(eval_success),
+-        }
++            # mtrl-aligned EVAL keys — exactly the multi-task PPO test scope
++            # (logger.py: test/mean_win_rate + test_win_rate/{task}), so SAC
++            # and PPO MT50 success rates are the same metric, no conversion:
++            # success-once over one episode per benchmark goal, mean over
++            # goals then tasks.
++            "test/mean_win_rate": float(np.mean(eval_success)),
++            # NOTE: deliberately NOT named worst/success — mtrl's worst/success
++            # is a TRAINING-side min with carry-forward; this is the eval-side
++            # min (deterministic, 50 goals).  Distinct key avoids overlaying
++            # different distributions in one panel.
++            "test/worst_win_rate": float(np.min(eval_success)),
++            **{
++                f"test_win_rate/{env_name_item}": float(eval_stat["success"])
++                for env_name_item, eval_stat in zip(env_names, eval_stats)
++                if "success" in eval_stat
++            },
++        },
++        step=es,
+     )
+     for env_name_item, eval_stat in zip(env_names, eval_stats):
+         wandb.log(
+@@ -106,7 +203,8 @@
+                     for k, v in eval_stat.items()
+                     if "length" not in k
+                 },
+-            }
++            },
++            step=es,
+         )
+     return eval_returns, eval_success
+ 
+@@ -117,7 +215,16 @@
+     seed: int,
+     max_path_length: int = 500,
+     rand_g: bool = True,
++    reward_mode: str = "normalized_dense",
++    obs_dim: int = 100,
++    rf_version: str = "v2",
+ ) -> gym.Env:
++    if domain == "metaworld3":
++        import metaworld3_ars
++        return metaworld3_ars.get_mw3_envs(
++            benchmark_name, seed, max_path_length,
++            reward_function_version=rf_version)
++    import metaworld
+     try:
+         benchmark_class = getattr(metaworld, benchmark_name)
+         benchmark = benchmark_class(seed=seed)
+@@ -152,8 +259,16 @@
+ 
+ 
+ def make_eval_benchmark(
+-    domain: str, benchmark_name: str, seed: int, tasks, max_path_length: int = 500
++    domain: str, benchmark_name: str, seed: int, tasks, max_path_length: int = 500,
++    reward_mode: str = "normalized_dense", obs_dim: int = 100,
++    rf_version: str = "v2",
+ ) -> gym.Env:
++    if domain == "metaworld3":
++        import metaworld3_ars
++        return metaworld3_ars.get_mw3_eval_envs(
++            benchmark_name, seed, tasks, max_path_length,
++            reward_function_version=rf_version)
++    import metaworld
+     try:
+         benchmark_class = getattr(metaworld, benchmark_name)
+         benchmark = benchmark_class(seed=seed)
+--- a/value_net.py
++++ b/value_net.py
+@@ -45,6 +45,13 @@
+     init_layer_norm: bool = False
+     dtype: Optional[Dtype] = jnp.float32
+     name: str = "critic"
++    # PopArt per-task affine head (critic balancing): when on, the module
++    # output is the NORMALIZED q̂ — raw Q = sigma_i * q̂ + mu_i with (mu, sigma)
++    # tracked in the Learner.  init W=1, b=0 => identity, bit-identical to
++    # popart=False at construction.  The affine is shared across the ensemble
++    # (POP rescaling in the learner adjusts these two params in-place).
++    popart: bool = False
++    n_task: int = 1
+ 
+     @nn.compact
+     def __call__(self, observations: jnp.ndarray, actions: jnp.ndarray) -> jnp.ndarray:
+@@ -65,6 +72,13 @@
+             self.init_layer_norm,
+             self.dtype,
+         )(observations, actions)
++        if self.popart:
++            w = self.param("popart_w", nn.initializers.ones, (self.n_task,))
++            b = self.param("popart_b", nn.initializers.zeros, (self.n_task,))
++            if q_values.ndim == 3:  # (n_ensemble, n_task, batch)
++                q_values = q_values * w[None, :, None] + b[None, :, None]
++            # 2-D init trace (dummy (1, obs_dim) inputs): identity at init
++            # (W=1, b=0) — params are registered above either way.
+         return q_values
+ 
+ 
+--- a/wrappers/__init__.py
++++ b/wrappers/__init__.py
+@@ -1,4 +1,12 @@
+-from wrappers.episode_monitor import EpisodeMonitor
+-from wrappers.single_precision import SinglePrecision
+ from wrappers.vec_env import MultiParallelEnvExecutor
+ from wrappers.vec_env import MultiParallelEvalEnvExecutor
++
++# EpisodeMonitor / SinglePrecision are old-gym (0.18.3) wrappers used only by
++# the vendored-metaworld CPU path; the metaworld3 env stack
++# (gymnasium-only, no old gym installed) never touches them.
++try:
++    from wrappers.episode_monitor import EpisodeMonitor
++    from wrappers.single_precision import SinglePrecision
++except ModuleNotFoundError:  # old gym not installed (metaworld3 envs)
++    EpisodeMonitor = None
++    SinglePrecision = None
+--- a/wrappers/vec_env.py
++++ b/wrappers/vec_env.py
+@@ -1,9 +1,10 @@
+ import numpy as np
+ import pickle as pickle
++import os
+ from multiprocessing import Process, Pipe
+ from gymnasium.spaces import Box
+-from typing import Tuple, Optional, Sequence
+-from common import InfoDict
++from typing import Tuple, Optional, Sequence, Dict
++InfoDict = Dict[str, float]
+ 
+ 
+ class MultiIterativeEnvExecutor(object):
+@@ -193,6 +194,27 @@
+         for remote in self.work_remotes:
+             remote.close()
+ 
++        # MetaWorld 3 lazily builds MuJoCo models on first use. Building 50
++        # MjModels concurrently can crash inside libc++; warm them in bounded
++        # batches before JAX is imported. This does not consume reset RNG.
++        if self.envs and hasattr(self.envs[0], "_ensure_env"):
++            build_parallelism = max(1, int(os.environ.get("MUJOCO_BUILD_PARALLELISM", "4")))
++            for start in range(0, len(self.remotes), build_parallelism):
++                batch = self.remotes[start:start + build_parallelism]
++                for remote in batch:
++                    remote.send(("build", None))
++                for offset, remote in enumerate(batch):
++                    idx = start + offset
++                    if not remote.poll(float(os.environ.get("MUJOCO_BUILD_TIMEOUT", "60"))):
++                        proc = self.ps[idx]
++                        raise RuntimeError(
++                            f"MuJoCo worker {idx} did not build in time "
++                            f"(alive={proc.is_alive()}, exitcode={proc.exitcode})"
++                        )
++                    remote.recv()
++                    if os.environ.get("MUJOCO_BUILD_VERBOSE") == "1":
++                        print(f"[mujoco-init] worker {idx + 1}/ {len(self.remotes)} ready", flush=True)
++
+         if self.n_tasks > 1 and self.tasks is not None:
+             self.set_tasks(self.tasks.values())
+ 
+@@ -497,6 +519,15 @@
+             obs, rewards, dones, infos = map(list, zip(*all_results))
+             remote.send((obs, rewards, dones, infos))
+ 
++        # Build lazy native simulators without consuming reset RNG. The parent
++        # sends this in bounded batches to avoid massive concurrent MuJoCo XML compilation.
++        elif cmd == "build":
++            for env in envs:
++                ensure_env = getattr(env, "_ensure_env", None)
++                if ensure_env is not None:
++                    ensure_env()
++            remote.send(0)
++
+         # reset all the environments of the worker
+         elif cmd == "reset":
+             obs = [env.reset() for env in envs]

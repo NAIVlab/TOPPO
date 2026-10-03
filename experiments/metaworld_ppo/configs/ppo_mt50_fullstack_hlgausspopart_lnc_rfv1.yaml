@@ -1,0 +1,92 @@
+# Full stack: PCGrad-a + FG-c (alpha=1) + LN-c with the
+# hlgausspopart critic composition.
+# W&B group: mt50v1_ppo_apc_cfg1_nhg2400paw_lnc_vc0_400x3
+# hlgauss settings are IDENTICAL to the LN-c-rung arm
+# (ppo_mt50_hlgausspopart_lnc_rfv1.yaml) so the two rungs are directly comparable;
+# only the gradient block changes.
+# NOTE value_clip stays false (hlgauss has no CE analog of PPO value
+# clipping), so this arm is clip-off while the full-stack reward-norm and
+# PopArt-EMA references (ppo_mt50_fullstack_rewnorm_lnc_rfv1.yaml,
+# post_submission/ppo_mt50_apcg_cfg_popart_ema_lnc_rfv1.yaml) are clip-on --
+# the same confound already disclosed at the LN-c rung.
+# NOTE pcgrad-actor may require MTRL_PCGRAD_CPU=1 on some nodes (CUDA torch.dot
+# SIGFPE in mtrl/gradients/pcgrad.py:75).
+project_name: toppo-repro
+exp_name: ppo_mt50_apcg_cfg_hlgausspopart_lnc_rfv1
+seed: 0
+device: cuda
+algo: ppo
+use_linear_baseline: false
+env:
+  env_name: MT50
+  max_episode_steps: 500
+  use_one_hot: true
+  num_tasks: 50
+  terminate_on_success: false
+  task_select: random
+  reward_normalization_method: null
+  num_envs: 50
+  reward_function_version: v1
+network:
+  preprocess_net: []
+  actor:
+  - 400
+  - 400
+  - 400
+  critic:
+  - 400
+  - 400
+  - 400
+  actor_head: []
+  critic_head: []
+  activation: relu
+  ln_critic: true
+training:
+  epoch: 100
+  step_per_epoch: 1000000
+  step_per_collect: 500000
+  repeat_per_collect: 16
+  batch_size: 15625
+  minibatch_sampling: stratified
+  learning_rate: 0.0003
+  gamma: 0.99
+  max_grad_norm: 1.0
+ppo:
+  gae_lambda: 0.97
+  clip_range: 0.2
+  value_clip: false
+  vf_coef: 0.001
+  ent_coef: 0.005
+  advantage_normalization: true
+  recompute_advantage: true
+  use_popart: true
+  popart_min_std: 0.01
+  use_return_scaling: false
+  return_scaling_min_sigma: 0.01
+  critic_loss_mode: hlgauss
+  hlgauss_num_bins: 2400
+  hlgauss_vmin: -10.0
+  hlgauss_vmax: 60.0
+  hlgauss_sigma_ratio: 0.75
+gradient:
+  actor_method: pcgrad
+  critic_method: fairgrad
+  cagrad_alpha: 0.5
+  fairgrad_actor_alpha: 2.0
+  fairgrad_critic_alpha: 1.0
+logging:
+  use_wandb: true
+  use_tensorboard: false
+  use_csv: true
+  train_interval: 2000
+  test_interval: 2
+  update_interval: 1
+  info_interval: 1
+  save_interval: 1000000
+  save_best: false
+  log_dir: logs
+  wandb_group: ppo_mt50_apcg_cfg_hlgausspopart_lnc_rfv1
+  wandb_tags:
+  - mt50
+  - rfv1
+  - lnc

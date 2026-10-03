@@ -1,0 +1,81 @@
+# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0): the network,
+# discriminator and reward settings follow data/agents/amp_task_humanoid_agent.yaml; the
+# changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+
+# AMP-SAC critic-balancing arm with PopArt REPLACED by
+# [2] return-based scaling (Schaul et al. 2021, arXiv:2105.05347): leave
+# rewards and targets untouched and divide the per-component value-loss
+# residual by sigma_k, sigma^2 = Var[R] + Var[gamma] E[G^2], cumulative
+# fp64 statistics, no tunable hyperparameter beyond the floor.
+#
+# Identical to amp_sac_walk_cb_agent.yaml except that PopArt is off
+# (use_popart: false, no popart_* keys) and the w5_norm block is added, so the
+# comparison isolates the normalization scheme.
+agent_name: AMPSAC
+model:
+  actor_net: fc_2layers_1024units
+  actor_init_output_scale: 0.01
+  actor_init_logstd: -1.0
+  actor_logstd_min: -5.0
+  actor_logstd_max: 2.0
+  critic_net: fc_2layers_1024units
+  num_critics: 2
+  disc_net: fc_2layers_1024units
+actor_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+critic_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+  grad_clip: 0.0
+alpha_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+disc_optimizer:
+  type: SGD
+  learning_rate: 0.00025
+  weight_decay: 0.0001
+discount: 0.99
+steps_per_iter: 8
+iters_per_output: 40
+test_episodes: 32
+normalizer_samples: 100000000
+use_mixed_precision: false
+batch_size: 4096
+updates_per_iter: 64
+replay_buffer_size: 1000000
+min_buffer_samples: 98304
+random_action_samples: 98304
+tau: 0.005
+init_alpha: 1.0
+learn_alpha: true
+target_entropy: auto
+actor_critic_agg: min
+disc_batch_size: 2
+disc_updates_per_iter: 8
+disc_buffer_size: 200000
+disc_replay_samples: 1000
+disc_logit_reg: 0.01
+disc_grad_penalty: 5
+disc_reward_scale: 2
+task_reward_weight: 0.5
+disc_reward_weight: 0.5
+toppo:
+  enabled: true
+  num_tasks: 2
+  task_names:
+  - task_reward
+  - disc_reward
+  actor_components: false
+  actor_method: default
+  critic_method: fairgrad
+  fairgrad_alpha: 1.0
+  fairgrad_rescale: false
+  fairgrad_gram_dtype: float32
+  critic_layer_norm: true
+  critic_layer_norm_biasless: true
+  use_popart: false
+  critic_coef: 1.0
+w5_norm:
+  method: retscale
+  retscale_min_sigma: 0.01

@@ -1,0 +1,9 @@
+wandb_group	agent_config	tag	gpu	ncpu	wall_s	incremental_samples_per_s	gpu_util_pct_raw	peak_mem_MiB	fairgrad_combine_ms	samples
+ampwalk_ppo_ad_cd_nnone_ln0_k1_gc1	amp_task_humanoid_long_critic_clip1_agent.yaml	ppo_base	NVIDIA H200 NVL	8	189.5	60302	62.1	15732	-	8126464
+ampwalk_ppo_ad_cfg1_npaw_lnc_k2_gc0	amp_task_humanoid_toppo_cc100_noclip_agent.yaml	ppo_fairgrad	NVIDIA H200 NVL	8	191.2	57815	64.1	16794	1.90	8126464
+ampwalk_ppo_apc_cfg1_npaw_lnc_k2_gc0	amp_task_humanoid_fulltoppo_cc100_agent.yaml	ppo_pcgrad	NVIDIA H200 NVL	8	197.5	56795	64.5	16794	2.00	8126464
+ampwalk_ppo_ad_cd_npaw_lnc_k2_gc1	amp_task_humanoid_component_welford_ln_clip1_agent.yaml	ppo_popart	NVIDIA H200 NVL	8	191.6	59645	62.8	16506	-	8126464
+ampwalk_sac_ad_cd_nnone_ln0_k1_gc0	amp_sac_walk_agent.yaml	sac_base	NVIDIA H200 NVL	8	287.6	34239	74.2	13964	-	8028160
+ampwalk_sac_ad_cfg1_npaw_lnc_k2_gc0	amp_sac_walk_cb_agent.yaml	sac_fairgrad	NVIDIA H200 NVL	8	397.3	22777	76.4	14256	2.39	8028160
+ampwalk_sac_apc_cfg1_npaw_lnc_k2_gc0	amp_sac_walk_fullstack_agent.yaml	sac_pcgrad	NVIDIA H200 NVL	8	430.1	20852	76.5	14256	2.31	8028160
+ampwalk_sac_ad_cd_npaw_lnc_k2_gc0	amp_sac_walk_cd_agent.yaml	sac_popart	NVIDIA H200 NVL	8	359.3	25624	77.0	13968	-	8028160

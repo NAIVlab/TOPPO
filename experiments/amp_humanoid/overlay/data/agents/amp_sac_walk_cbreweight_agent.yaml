@@ -1,0 +1,103 @@
+# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0): the network,
+# discriminator and reward settings follow data/agents/amp_task_humanoid_agent.yaml; the
+# changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+
+# Critic stack applied on top of a re-weighted objective (style weight 1.105,
+# the steady-state ARS scale measured on this task; see
+# amp_sac_walk_reweight_agent.yaml). It tests whether the critic stack helps
+# once the objective no longer over-serves the task component. Differs from
+# amp_sac_walk_cb_agent.yaml by disc_reward_weight alone, and from
+# amp_sac_walk_reweight_agent.yaml by the toppo block alone.
+#
+# Critic stack as in amp_sac_walk_cb_agent.yaml:
+# 2-component twin-Q critic (task, disc), biasless Linear+LayerNorm trunk,
+# Welford ComponentPopArt on Q targets, FairGrad (alpha 1, no rescale) over the
+# per-component TD losses on the shared trunk, critic_coef 1.0, no critic grad
+# clip. This mirrors the PPO arm amp_task_humanoid_toppo_cc100_noclip_agent.yaml.
+# Actor-side PCGrad is off.
+agent_name: AMPSAC
+
+model:
+  actor_net: fc_2layers_1024units
+  actor_init_output_scale: 0.01
+  actor_init_logstd: -1.0
+  actor_logstd_min: -5.0
+  actor_logstd_max: 2.0
+  critic_net: fc_2layers_1024units
+  num_critics: 2
+  disc_net: fc_2layers_1024units
+
+actor_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+
+critic_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+  grad_clip: 0.0
+
+alpha_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+
+disc_optimizer:
+  type: SGD
+  learning_rate: 2.5e-4
+  weight_decay: 0.0001
+
+discount: 0.99
+steps_per_iter: 8
+iters_per_output: 40
+test_episodes: 32
+normalizer_samples: 100000000
+use_mixed_precision: false
+
+batch_size: 4096
+updates_per_iter: 64
+replay_buffer_size: 1000000
+# 98304 = exactly 3 collection iterations (3 x 8 x 4096)
+min_buffer_samples: 98304
+random_action_samples: 98304
+tau: 0.005
+init_alpha: 1.0
+learn_alpha: true
+target_entropy: auto
+actor_critic_agg: min
+
+# disc_batch_size is a MULTIPLIER of num_envs (as in the AMP-PPO yamls): 2 ->
+# 8192. 8 updates x 8192 per 32768 collected samples reproduces AMP-PPO's
+# discriminator budget exactly: 1 optimizer step / 4096 samples, 2 demo, 2
+# current-window-negative and 2 replay-negative examples per collected sample.
+disc_batch_size: 2
+disc_updates_per_iter: 8
+disc_buffer_size: 200000
+disc_replay_samples: 1000
+disc_logit_reg: 0.01
+disc_grad_penalty: 5
+disc_reward_scale: 2
+
+task_reward_weight: 0.5
+disc_reward_weight: 1.105
+
+toppo:
+  enabled: true
+  num_tasks: 2
+  task_names:
+  - task_reward
+  - disc_reward
+  actor_components: false
+  actor_method: default
+  critic_method: fairgrad
+  fairgrad_alpha: 1.0
+  fairgrad_rescale: false
+  # The KxK Gram is the entire FairGrad cost on workstation cards (fp64 GEMM:
+  # 480 ms vs 7.75 ms in fp32 at N=1.37M); computing it in fp32 shifts the
+  # FairGrad weights by ~1e-7 (verified in tests) and takes a 100M seed from
+  # ~22 h to ~2 h. The solve, the combination and all diagnostics stay fp64.
+  fairgrad_gram_dtype: float32
+  critic_layer_norm: true
+  critic_layer_norm_biasless: true
+  use_popart: true
+  popart_method: welford
+  popart_min_std: 0.01
+  critic_coef: 1.0

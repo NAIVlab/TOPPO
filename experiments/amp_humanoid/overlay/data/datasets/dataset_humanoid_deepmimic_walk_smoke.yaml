@@ -1,0 +1,3 @@
+motions:
+  - file: "data/motions/humanoid/deepmimic_humanoid_walk.pkl"
+    weight: 1.0

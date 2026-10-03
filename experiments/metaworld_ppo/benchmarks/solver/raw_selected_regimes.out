@@ -1,0 +1,8 @@
+cpu: AMD Ryzen 9 9950X 16-Core Processor  threads: OMP_NUM_THREADS=1
+alpha=1.0  D=1024  seed=42  n_runs=7  (median ms; residual ||Gx - x^(-1/alpha)||; target eta = 1e-2)
+regime                       |    scipy     sgd    cold    warm ms | it cold it warm  nfev |  r scipy    r sgd   r cold   r warm | speedup
+K=50, spread 1x              |     3.04    1.53   0.077   0.056    |       4       2     6 |  1.9e-13  5.0e+01  3.4e-07  2.4e-05 |      54x
+K=10, rand, spread 1e6x      |    51.49    1.49   0.182   0.040    |      12       2   442 |  1.1e-11  5.2e+06  2.6e-09  4.8e-05 |    1297x
+K=50, rand, spread 1e8x      |  1226.79    1.50   0.211   2.067    |      10      50  2514 |  1.3e-10  5.6e+01  6.2e-03  2.0e-02 |     593x
+K=50, orth, spread 1e8x      |    85.76    1.46   0.212   0.052    |      10       2   220 |  7.0e-11  5.6e+01  6.2e-03  3.2e-05 |    1637x
+K=50, orth 25%, spread 1e8x  |     7.07    1.47   0.234   0.052    |      11       2    16 |  5.3e-03  7.8e+01  7.9e-03  4.7e-05 |     136x

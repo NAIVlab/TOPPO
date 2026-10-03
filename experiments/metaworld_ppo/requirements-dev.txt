@@ -1,0 +1,3 @@
+# Unit tests: pip install -r requirements-dev.txt && python -m pytest tests
+-r requirements.txt
+pytest

@@ -1,0 +1,90 @@
+# PopArt + HL-Gauss (MT50-V1).
+# Tests whether normalizing targets per task before projection -- which is
+# PopArt's ART machinery -- lets PopArt and HL-Gauss compose rather than
+# compete.  ART supplies the per-task (mu_i, sigma_i) that normalize the
+# regression TARGET before projection, so a single fixed support serves all
+# 50 tasks with per-task mean 0 and std 1 BY CONSTRUCTION.  This config uses
+# support [-10, 60] @ 2400 bins (bin width 0.0292).  ART-normalized targets
+# are per-task mean-0/std-1 in principle, but a 4M-step smoke run measured a
+# strongly RIGHT-SKEWED pooled distribution (min -1.5, max +54.7): tasks with
+# a small sigma_i (min 5.18) spike tens of sigma during early learning.  A
+# symmetric [-15, 15] support at 600 bins therefore wasted the left half and
+# clipped 3 tasks >1e-3.
+# NOTE the POP half (W,b renormalization preserving raw V across a stats
+# update) has no categorical analog -- a (mu,sigma) update silently re-scales
+# what fixed-support logits decode to -- so the composition is ART only:
+# PopArt supplies the target statistics, and MultiTaskCritic.forward()
+# denormalizes the HL-Gauss readout with them.
+project_name: toppo-repro
+exp_name: ppo_mt50_ad_cd_hlgausspopart_lnc_rfv1
+seed: 0
+device: cuda
+algo: ppo
+use_linear_baseline: false
+
+env:
+  env_name: MT50
+  max_episode_steps: 500
+  use_one_hot: true
+  num_tasks: 50
+  terminate_on_success: false
+  task_select: random
+  reward_normalization_method: null
+  num_envs: 50
+  reward_function_version: v1
+
+network:
+  preprocess_net: []
+  actor: [400, 400, 400]
+  critic: [400, 400, 400]
+  actor_head: []
+  critic_head: []
+  activation: relu
+  ln_critic: true
+
+training:
+  epoch: 100
+  step_per_epoch: 1000000
+  step_per_collect: 500000
+  repeat_per_collect: 16
+  batch_size: 15625
+  minibatch_sampling: stratified
+  learning_rate: 0.0003
+  gamma: 0.99
+  max_grad_norm: 1.0
+
+ppo:
+  gae_lambda: 0.97
+  clip_range: 0.2
+  value_clip: false
+  vf_coef: 0.001
+  ent_coef: 0.005
+  advantage_normalization: true
+  recompute_advantage: true
+  use_popart: true
+  popart_min_std: 0.01
+  use_return_scaling: false
+  return_scaling_min_sigma: 0.01
+  critic_loss_mode: hlgauss
+  hlgauss_num_bins: 2400
+  hlgauss_vmin: -10.0
+  hlgauss_vmax: 60.0
+  hlgauss_sigma_ratio: 0.75
+
+gradient:
+  actor_method: default
+  critic_method: default
+
+logging:
+  use_wandb: true
+  use_tensorboard: false
+  use_csv: true
+  train_interval: 2000
+  test_interval: 2
+  update_interval: 1
+  info_interval: 1
+  save_interval: 1000000
+  save_best: false
+  log_dir: logs
+  wandb_group: ppo_mt50_ad_cd_hlgausspopart_lnc_rfv1
+  wandb_tags: [mt50, rfv1, lnc]

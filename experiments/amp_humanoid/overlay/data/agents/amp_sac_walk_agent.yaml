@@ -1,0 +1,75 @@
+# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0): the network,
+# discriminator and reward settings follow data/agents/amp_task_humanoid_agent.yaml; the
+# changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+
+# MT-SAC baseline arm for the AMP humanoid walk-steering benchmark.
+# Env/discriminator/reward protocol mirrors the AMP-PPO arms
+# (amp_task_humanoid_long_critic_clip1_agent.yaml): same disc nets, disc
+# hyperparameters, reward weights (0.5/0.5, disc_reward_scale 2), gamma 0.99.
+# Off-policy specifics: 1M-transition replay, twin Q, auto-tuned alpha,
+# style reward re-labeled from the current discriminator at update time.
+agent_name: AMPSAC
+
+model:
+  actor_net: fc_2layers_1024units
+  actor_init_output_scale: 0.01
+  actor_init_logstd: -1.0
+  actor_logstd_min: -5.0
+  actor_logstd_max: 2.0
+  critic_net: fc_2layers_1024units
+  num_critics: 2
+  disc_net: fc_2layers_1024units
+
+actor_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+
+critic_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+  grad_clip: 0.0
+
+alpha_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+
+disc_optimizer:
+  type: SGD
+  learning_rate: 2.5e-4
+  weight_decay: 0.0001
+
+discount: 0.99
+steps_per_iter: 8
+iters_per_output: 40
+test_episodes: 32
+normalizer_samples: 100000000
+use_mixed_precision: false
+
+# SAC update schedule: 8 * num_envs new transitions per iter, 64 updates of
+# batch 4096 -> 1 gradient update per 512 new env samples.
+batch_size: 4096
+updates_per_iter: 64
+replay_buffer_size: 1000000
+# 98304 = exactly 3 collection iterations (3 x 8 x 4096)
+min_buffer_samples: 98304
+random_action_samples: 98304
+tau: 0.005
+init_alpha: 1.0
+learn_alpha: true
+target_entropy: auto
+actor_critic_agg: min
+
+# disc_batch_size is a MULTIPLIER of num_envs (as in the AMP-PPO yamls): 2 ->
+# 8192. 8 updates x 8192 per 32768 collected samples reproduces AMP-PPO's
+# discriminator budget exactly: 1 optimizer step / 4096 samples, 2 demo, 2
+# current-window-negative and 2 replay-negative examples per collected sample.
+disc_batch_size: 2
+disc_updates_per_iter: 8
+disc_buffer_size: 200000
+disc_replay_samples: 1000
+disc_logit_reg: 0.01
+disc_grad_penalty: 5
+disc_reward_scale: 2
+
+task_reward_weight: 0.5
+disc_reward_weight: 0.5

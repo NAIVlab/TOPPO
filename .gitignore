@@ -1,0 +1,45 @@
+# --- run artifacts -------------------------------------------------------
+logs/
+run_logs/
+wandb/
+wandb_runs/
+checkpoints/
+output/
+videos/
+*.mp4
+*.pth
+*.pt
+MUJOCO_LOG.TXT
+# per-job TMPDIR that the Meta-World Slurm templates create under the project
+tmp/
+# AMP: the tree setup.sh assembles by default (a full MimicKit clone), and the
+# default output of analysis/amp_figure.py when run from that directory
+experiments/amp_humanoid/mimickit_toppo/
+experiments/amp_humanoid/amp_transfer.*
+
+# --- python --------------------------------------------------------------
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv*/
+build/
+*.egg-info/
+
+# --- credentials and machine-local config (NEVER commit) -----------------
+slurm/wandb_api_key.txt
+**/wandb_api_key.txt
+.wandb_env
+**/.wandb_env
+.wandb_api_key
+.env
+*.hpc.conf
+*.ws.conf
+.netrc
+
+# --- agent / editor scratch ---------------------------------------------
+.codex/
+.agents/
+.agent/
+.claude/
+.aris/
+.nfs*

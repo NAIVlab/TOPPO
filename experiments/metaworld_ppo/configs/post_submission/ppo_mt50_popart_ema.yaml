@@ -1,0 +1,75 @@
+# PopArt-EMA isolation (post-submission): PopArt ON with the EMA estimator,
+# critic LayerNorm OFF.  NEVER RUN: no W&B group, and no number in the paper
+# comes from this config.  `network.ln_critic: false` is stated EXPLICITLY --
+# NetworkConfig's dataclass default is `true` in this release, so omitting the
+# key would silently turn LN-c on and change the experiment.
+project_name: toppo-repro
+exp_name: ppo_mt50_popart_ema
+seed: 0
+device: cuda:0
+algo: ppo
+use_linear_baseline: false
+
+env:
+  env_name: MT50
+  max_episode_steps: 500
+  use_one_hot: true
+  num_tasks: 50
+  terminate_on_success: false
+  task_select: random
+  reward_normalization_method: null
+  num_envs: 50
+
+network:
+  preprocess_net: []
+  actor: [400, 400, 400]
+  critic: [400, 400, 400]
+  actor_head: []
+  critic_head: []
+  activation: relu
+  # Explicit: this run has NO critic LayerNorm (dataclass default is true).
+  ln_critic: false
+
+training:
+  epoch: 100
+  step_per_epoch: 1000000
+  step_per_collect: 500000
+  repeat_per_collect: 16
+  batch_size: 15625
+  minibatch_sampling: stratified
+  learning_rate: 0.0003
+  gamma: 0.99
+  max_grad_norm: 1.0
+
+ppo:
+  gae_lambda: 0.97
+  clip_range: 0.2
+  value_clip: true
+  vf_coef: 0.001
+  ent_coef: 0.005
+  advantage_normalization: true
+  recompute_advantage: true
+  use_popart: true
+  popart_min_std: 0.01
+  # PopArt-EMA variant (Hessel 2019 multi-task reference).  β is per-sample
+  # (not per-batch); a task batch of N returns is folded in as N sequential
+  # EMA updates via the closed-form vectorization in PopArtModule._merge_ema.
+  popart_method: ema
+  popart_ema_decay: 3.0e-4
+
+gradient:
+  actor_method: default
+  critic_method: default
+
+logging:
+  use_wandb: true
+  use_tensorboard: false
+  use_csv: true
+  train_interval: 2000
+  test_interval: 2
+  update_interval: 1
+  info_interval: 1
+  save_interval: 0
+  save_best: true
+  log_dir: logs
+  wandb_group: ppo_popart_ema_mt50

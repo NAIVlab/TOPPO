@@ -1,0 +1,70 @@
+# EMA PopArt arm (W&B group mt50v2_ppo_ad_cfg1_npae_lnc_vc1_400x3), explored after submission.
+# The paper's Welford rows of this arm use ../ppo_mt50_ad_cfg_popart_lnc_rfv2.yaml instead.
+project_name: toppo-repro
+exp_name: ppo_mt50_ad_cfg_popart_ema_lnc_rfv2
+seed: 0
+device: cuda:0
+algo: ppo
+use_linear_baseline: false
+
+env:
+  env_name: MT50
+  reward_function_version: v2
+  max_episode_steps: 500
+  use_one_hot: true
+  num_tasks: 50
+  terminate_on_success: false
+  task_select: random
+  reward_normalization_method: null
+  num_envs: 50
+
+network:
+  preprocess_net: []
+  actor: [400, 400, 400]
+  critic: [400, 400, 400]
+  actor_head: []
+  critic_head: []
+  activation: relu
+  ln_critic: true
+
+training:
+  epoch: 100
+  step_per_epoch: 1000000
+  step_per_collect: 500000
+  repeat_per_collect: 16
+  batch_size: 15625
+  minibatch_sampling: stratified
+  learning_rate: 0.0003
+  gamma: 0.99
+  max_grad_norm: 1.0
+
+ppo:
+  gae_lambda: 0.97
+  clip_range: 0.2
+  value_clip: true
+  vf_coef: 0.001
+  ent_coef: 0.005
+  advantage_normalization: true
+  recompute_advantage: true
+  use_popart: true
+  popart_min_std: 0.01
+  popart_method: ema
+  popart_ema_decay: 3.0e-4
+
+gradient:
+  actor_method: default
+  critic_method: fairgrad
+  fairgrad_critic_alpha: 1.0
+
+logging:
+  use_wandb: true
+  use_tensorboard: false
+  use_csv: true
+  train_interval: 2000
+  test_interval: 2
+  update_interval: 1
+  info_interval: 1
+  save_interval: 1000000
+  save_best: false
+  log_dir: logs
+  wandb_group: ppo_mt50_ad_cfg_popart_ema_lnc_rfv2

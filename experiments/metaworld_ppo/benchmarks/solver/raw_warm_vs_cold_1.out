@@ -1,0 +1,7 @@
+ALPHA = 1.0
+scenario            scipy ms | yN cold ms  it | yN warm ms  it | spd(cold) spd(warm)
+well-cond K=50        163.90 |      0.263   2 |      0.217   2 |      622x      754x
+1 near-dead K=50      383.82 |      0.913   9 |      0.226   2 |      421x     1702x
+5 near-dead K=50      229.31 |      0.994  10 |      0.237   2 |      231x      966x
+16 near-dead K=50     511.05 |      1.007  10 |      0.218   2 |      507x     2340x
+realistic K=10         28.35 |      0.465   7 |      0.083   1 |       61x      343x

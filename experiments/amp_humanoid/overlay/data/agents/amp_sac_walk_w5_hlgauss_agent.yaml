@@ -1,0 +1,108 @@
+# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0): the network,
+# discriminator and reward settings follow data/agents/amp_task_humanoid_agent.yaml; the
+# changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+
+# AMP-SAC critic-balancing arm with PopArt REPLACED by
+# [3] HL-Gauss (Farebrother et al. 2024, arXiv:2403.03950): replace the
+# per-component squared error with cross-entropy against a Gaussian-smoothed
+# categorical projection of the target; the scalar value is read back as the
+# expectation over bin centers.
+#
+# The support is the one hyperparameter this method adds over PopArt, and it is
+# set from the MEASURED per-component value range of the PopArt control on this
+# exact task: a finished 100M walk run of
+# amp_task_humanoid_component_welford_ln_clip1_agent.yaml (seed 260511473)
+# ends at Toppo_Return_Mean_Task_Reward 27.2 / Disc_Reward 11.8, with maxima
+# 27.3 / 19.8. [-10, 60] is ~2.2x the largest value ever logged.
+#
+# The support is a two-sided constraint, which is why it is not simply set wide:
+#   too small -> targets are CLAMPED, the component Q pins at its ceiling and
+#     the gradient for that component dies. w5_hlgauss_oob_frac is logged once
+#     per iteration (windowed, not cumulative) to make that visible.
+#   too wide  -> at fixed bin count the bins get coarse, and at fixed bin width
+#     the critic has to move softmax mass across many more bins to represent the
+#     same value. With the PPO critic on SGD lr 1e-4 + grad_clip 1.0 an earlier
+#     [-10, 350] support left the critic an order of magnitude below the true
+#     value at the end of the budget -- which would have measured a support/
+#     step-size mismatch and mislabelled it "HL-Gauss underperforms PopArt".
+# 141 bins gives a 0.496-wide bin, i.e. ~2% of the operating value.
+#
+# The head bias is initialized so the critic starts at 0 (as the PopArt control
+# does) rather than at the support center. Disclosed confound: a categorical
+# head is inherently larger (141 logits per component vs 1 scalar), so this arm
+# changes critic head capacity as well as the loss.
+#
+# Identical to amp_sac_walk_cb_agent.yaml except that PopArt is off
+# (use_popart: false, no popart_* keys) and the w5_norm block is added, so the
+# comparison isolates the normalization scheme.
+agent_name: AMPSAC
+model:
+  actor_net: fc_2layers_1024units
+  actor_init_output_scale: 0.01
+  actor_init_logstd: -1.0
+  actor_logstd_min: -5.0
+  actor_logstd_max: 2.0
+  critic_net: fc_2layers_1024units
+  num_critics: 2
+  disc_net: fc_2layers_1024units
+actor_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+critic_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+  grad_clip: 0.0
+alpha_optimizer:
+  type: Adam
+  learning_rate: 3e-4
+disc_optimizer:
+  type: SGD
+  learning_rate: 0.00025
+  weight_decay: 0.0001
+discount: 0.99
+steps_per_iter: 8
+iters_per_output: 40
+test_episodes: 32
+normalizer_samples: 100000000
+use_mixed_precision: false
+batch_size: 4096
+updates_per_iter: 64
+replay_buffer_size: 1000000
+min_buffer_samples: 98304
+random_action_samples: 98304
+tau: 0.005
+init_alpha: 1.0
+learn_alpha: true
+target_entropy: auto
+actor_critic_agg: min
+disc_batch_size: 2
+disc_updates_per_iter: 8
+disc_buffer_size: 200000
+disc_replay_samples: 1000
+disc_logit_reg: 0.01
+disc_grad_penalty: 5
+disc_reward_scale: 2
+task_reward_weight: 0.5
+disc_reward_weight: 0.5
+toppo:
+  enabled: true
+  num_tasks: 2
+  task_names:
+  - task_reward
+  - disc_reward
+  actor_components: false
+  actor_method: default
+  critic_method: fairgrad
+  fairgrad_alpha: 1.0
+  fairgrad_rescale: false
+  fairgrad_gram_dtype: float32
+  critic_layer_norm: true
+  critic_layer_norm_biasless: true
+  use_popart: false
+  critic_coef: 1.0
+w5_norm:
+  method: hlgauss
+  hlgauss_num_bins: 141
+  hlgauss_vmin: -10.0
+  hlgauss_vmax: 60.0
+  hlgauss_sigma_ratio: 0.75

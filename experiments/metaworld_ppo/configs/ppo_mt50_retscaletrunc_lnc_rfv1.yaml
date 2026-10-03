@@ -1,0 +1,75 @@
+# Critic-normalizer study: LN-c + retscaletrunc (PopArt slot swap), MetaWorld MT50 reward v1.
+# Identical to ppo_mt50_default.yaml except: use_popart false and
+# use_return_scaling true, with return_scaling_truncation_as_terminal true;
+# reward_function_version v1;
+# save_best false, and a checkpoint every 1M steps (save_interval) for preempt
+# resume.  Both evaluate every 2 epochs (paper protocol, 51 checkpoints).
+project_name: toppo-repro
+exp_name: ppo_mt50_ad_cd_retscaletrunc_lnc_rfv1
+seed: 0
+device: cuda
+algo: ppo
+use_linear_baseline: false
+
+env:
+  env_name: MT50
+  max_episode_steps: 500
+  use_one_hot: true
+  num_tasks: 50
+  terminate_on_success: false
+  task_select: random
+  reward_normalization_method: null
+  num_envs: 50
+  reward_function_version: v1
+
+network:
+  preprocess_net: []
+  actor: [400, 400, 400]
+  critic: [400, 400, 400]
+  actor_head: []
+  critic_head: []
+  activation: relu
+  ln_critic: true
+
+training:
+  epoch: 100
+  step_per_epoch: 1000000
+  step_per_collect: 500000
+  repeat_per_collect: 16
+  batch_size: 15625
+  minibatch_sampling: stratified
+  learning_rate: 0.0003
+  gamma: 0.99
+  max_grad_norm: 1.0
+
+ppo:
+  gae_lambda: 0.97
+  clip_range: 0.2
+  value_clip: true
+  vf_coef: 0.001
+  ent_coef: 0.005
+  advantage_normalization: true
+  recompute_advantage: true
+  use_popart: false
+  popart_min_std: 0.01
+  use_return_scaling: true
+  return_scaling_truncation_as_terminal: true
+  return_scaling_min_sigma: 0.01
+
+gradient:
+  actor_method: default
+  critic_method: default
+
+logging:
+  use_wandb: true
+  use_tensorboard: false
+  use_csv: true
+  train_interval: 2000
+  test_interval: 2
+  update_interval: 1
+  info_interval: 1
+  save_interval: 1000000
+  save_best: false
+  log_dir: logs
+  wandb_group: ppo_mt50_ad_cd_retscaletrunc_lnc_rfv1
+  wandb_tags: [mt50, rfv1, lnc]

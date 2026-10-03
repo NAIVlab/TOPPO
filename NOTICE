@@ -1,0 +1,111 @@
+TOPPO: Rethinking PPO for Multi-Task Reinforcement Learning with Critic Balancing
+Copyright (c) 2026 Yuanpeng Li
+
+This product includes software developed by third parties. The components
+below retain their own licenses; see the LICENSE file inside each component
+directory, or the file header for single-file adaptations, for the full text.
+Where a section below names an MIT-licensed upstream without such a file, its
+permission notice is the same text as the top-level LICENSE file, under the
+copyright line given in that section.
+
+--------------------------------------------------------------------------
+experiments/sac_baselines_ars/
+--------------------------------------------------------------------------
+Derived from "ARS: Adaptive Reward Scaling for Multi-Task Reinforcement
+Learning", Cho et al., ICML 2025.
+  Upstream: https://github.com/ms-cho/Adaptive-Reward-Scaling-ARS-for-MTRL
+  License:  MIT (upstream ships the MIT text with the copyright holder line
+            left blank; attributed here to the ARS authors, Cho et al.)
+Upstream in turn derives from JAXRL (MIT, Copyright (c) 2021 Ilya Kostrikov).
+Our modifications are listed in experiments/sac_baselines_ars/CHANGES.md and
+are offered under the MIT License above.
+
+--------------------------------------------------------------------------
+experiments/metaworld_ppo/mtrl/gradients/cagrad.py
+--------------------------------------------------------------------------
+The CAGrad solver (_cagrad_solve) is adapted from the official code of
+"Conflict-Averse Gradient Descent for Multi-task Learning", Liu et al.,
+NeurIPS 2021.
+  Upstream: https://github.com/Cranial-XIX/CAGrad
+            (mtrl/mtrl_files/cagrad.py, method cagrad, commit dc3d481)
+  License:  MIT, Copyright (c) 2022 Bo Liu. The full MIT notice is
+            reproduced in the header of that file, which also lists our
+            modifications.
+
+--------------------------------------------------------------------------
+FairGrad reference solvers
+--------------------------------------------------------------------------
+Short portions follow the official code of "Fair Resource Allocation in
+Multi-Task Learning", Ban & Ji, ICML 2024:
+  experiments/metaworld_ppo/mtrl/gradients/fairgrad.py and
+  experiments/sac_baselines_ars/fairgrad_host.py
+      the scipy least_squares fallback on the KKT residual
+      G x - x^(-1/alpha), as in methods/weight_methods.py (fairgrad);
+  experiments/metaworld_ppo/benchmarks/solver/selected_regimes_a1.py
+      ports of that scipy reference and of the SGD + momentum solver in
+      mtrl_files/fairgrad.py, used only as benchmark baselines.
+The y-space Newton solver and the rest of these files are ours.
+  Upstream: https://github.com/OptMN-Lab/fairgrad (commit b58bce8)
+  License:  MIT, Copyright (c) 2024 OptMN-Lab
+
+--------------------------------------------------------------------------
+experiments/metaworld_ppo/mtrl/algos/multitask_ppo.py
+--------------------------------------------------------------------------
+tianshou is the RL framework the PPO stack builds on (installed as a
+dependency, not redistributed), and MultiTaskPPO subclasses its PPO. The
+clipped-surrogate, dual-clip and value-clip loss code (in _update_with_batch,
+_compute_per_task_actor_terms and _compute_value_loss) is adapted from
+tianshou 2.0.0, tianshou/algorithm/modelfree/ppo.py.
+  Upstream: https://github.com/thu-ml/tianshou
+  License:  MIT, Copyright (c) 2022 Tianshou contributors
+
+--------------------------------------------------------------------------
+experiments/metaworld_ppo/mtrl/models/linear_baseline.py
+--------------------------------------------------------------------------
+Follows garage's LinearFeatureBaseline
+(src/garage/np/baselines/linear_feature_baseline.py), which descends from
+rllab (Duan et al., 2016). No shipped config enables it.
+  Upstream: https://github.com/rlworkgroup/garage
+  License:  MIT, Copyright (c) 2019 Reinforcement Learning Working Group
+
+--------------------------------------------------------------------------
+Other acknowledgments (methods and dependencies; no code redistributed)
+--------------------------------------------------------------------------
+Meta-World / Meta-World+ (Farama Foundation)   — benchmark environments
+PCGrad (Yu et al., 2020), Nash-MTL (Navon et al., 2022)
+PopArt (van Hasselt et al., 2016; Hessel et al., 2019)
+HL-Gauss (Farebrother et al., 2024)            — mtrl/models/hlgauss.py follows the
+                                                 paper's reference implementation
+openai/baselines VecNormalize (MIT, Copyright (c) 2017 OpenAI)
+                                               — update order of the "baselines_return"
+                                                 reward normalization
+
+--------------------------------------------------------------------------
+experiments/amp_humanoid/
+--------------------------------------------------------------------------
+A modification and extension of MimicKit, used for the paper's AMP humanoid
+stress test (Section 5.3, Appendix E.5).
+  Upstream: https://github.com/xbpeng/MimicKit (commit 2ed1e6c)
+  License:  Apache License 2.0, Copyright 2025 Xue Bin Peng. The full text is
+            experiments/amp_humanoid/LICENSE (MimicKit's LICENSE, verbatim);
+            upstream ships no NOTICE file.
+This directory, including our additions, is distributed under the Apache
+License 2.0, not under the top-level MIT LICENSE. Every MimicKit file that its
+patch modifies carries a notice at its top stating that it was changed
+(Apache-2.0, section 4(b)); those changes are contained in its patches/
+directory and listed in experiments/amp_humanoid/CHANGES.md. Five added
+Python modules adapt MimicKit code and say so in their headers. The 25 agent
+and 2 environment configurations in overlay/data/ are derived from MimicKit's
+configurations (the 9 PPO agent configurations and both environment
+configurations are modified copies of upstream ones; the 16 SAC agent
+configurations reuse upstream's network, discriminator and reward settings),
+and each carries a change notice naming its upstream source.
+experiments/amp_humanoid/NOTICE gives the full attribution, including the code
+it re-implements or follows (the FairGrad SciPy fallback of OptMN-Lab, MIT;
+the openai/baselines VecNormalize update order, MIT; the ARS reward scaling of
+Cho et al., MIT).
+DeepMimic motion data (https://github.com/xbpeng/DeepMimic, MIT, Copyright (c)
+2018 Xue Bin Peng): one clip, downloaded by setup.sh and not redistributed;
+its LICENSE is experiments/amp_humanoid/third_party/deepmimic/LICENSE.
+Runtime dependencies, not redistributed: the Newton physics simulator, NVIDIA
+Warp, MuJoCo and MuJoCo Warp (all Apache-2.0).

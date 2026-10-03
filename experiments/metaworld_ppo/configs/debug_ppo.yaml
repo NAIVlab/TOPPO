@@ -1,0 +1,64 @@
+# Tiny smoke-test config (10-unit nets, 20 short epochs).  Intentionally
+# vanilla: no critic LayerNorm, no PopArt, no value clipping.  All three are
+# stated EXPLICITLY because this release's dataclass defaults enable them.
+project_name: toppo-repro
+exp_name: debug_ppo_mt10
+seed: 42
+device: cuda
+algo: ppo
+
+env:
+  env_name: MT10
+  max_episode_steps: 500
+  use_one_hot: true
+  num_tasks: 10
+  terminate_on_success: false
+  task_select: random
+  reward_normalization_method: null
+  num_envs: 10
+
+network:
+  preprocess_net: [10]
+  actor: [10]
+  critic: [10]
+  actor_head: [10]
+  critic_head: [10]
+  activation: relu
+  # Explicit: this run has NO critic LayerNorm (dataclass default is true).
+  ln_critic: false
+
+training:
+  epoch: 20
+  step_per_epoch: 10000
+  step_per_collect: 1000
+  repeat_per_collect: 4
+  batch_size: 256
+  minibatch_sampling: mixed
+  learning_rate: 0.0005
+  gamma: 0.99
+  max_grad_norm: 1.0
+
+ppo:
+  gae_lambda: 0.97
+  clip_range: 0.2
+  vf_coef: 0.5
+  ent_coef: 0.01
+  # Explicit: debug runs stay vanilla (dataclass defaults enable all three).
+  value_clip: false
+  use_popart: false
+
+gradient:
+  actor_method: default
+  critic_method: default
+
+logging:
+  use_wandb: false
+  use_tensorboard: false
+  use_csv: false
+  train_interval: 1
+  test_interval: 1
+  update_interval: 2
+  info_interval: 1
+  save_interval: 999999
+  save_best: false
+  log_dir: logs

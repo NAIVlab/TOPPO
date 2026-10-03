@@ -1,0 +1,26 @@
+{
+  "rng_seed": 20260908,
+  "K": 10,
+  "D": 32,
+  "gram_min_eigenvalue": 0.005104298559343945,
+  "max_relative_component_kkt_residual_tight": 2.938516097117372e-11,
+  "single_task_results": {
+    "0.5": {
+      "max_relative_vector_error": 0.4062152739980766,
+      "min_cosine": 0.9424065293793863
+    },
+    "1.0": {
+      "max_relative_vector_error": 2.5754422393968887e-16,
+      "min_cosine": 1.0
+    },
+    "2.0": {
+      "max_relative_vector_error": 1.8453565421482276,
+      "min_cosine": 0.8175912434012669
+    },
+    "None": {
+      "max_relative_vector_error": 0.9399708204510737,
+      "min_cosine": 0.8327728986033341
+    }
+  },
+  "production_global_scale_min_norm_ratio": 3.33058730702338e-06
+}

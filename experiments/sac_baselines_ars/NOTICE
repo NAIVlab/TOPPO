@@ -1,0 +1,19 @@
+This directory contains a modified copy of:
+
+  ARS: Adaptive Reward Scaling for Multi-Task Reinforcement Learning
+  Cho et al., ICML 2025
+  https://github.com/ms-cho/Adaptive-Reward-Scaling-ARS-for-MTRL
+  Pinned at upstream commit 67f7df3.
+
+Upstream is distributed under the MIT License, reproduced verbatim in the
+LICENSE file in this directory. Upstream ships that MIT text with the
+copyright-holder line left blank; the copyright is understood to belong to the
+ARS authors (Cho et al.), and this NOTICE supplies that attribution.
+
+Upstream in turn derives from JAXRL:
+  https://github.com/ikostrikov/jaxrl
+  MIT License, Copyright (c) 2021 Ilya Kostrikov
+
+Modifications by Yuanpeng Li (2026) are enumerated in CHANGES.md and are
+offered under the MIT License in the repository root. patches/ contains those
+modifications as an applyable diff against upstream 67f7df3.

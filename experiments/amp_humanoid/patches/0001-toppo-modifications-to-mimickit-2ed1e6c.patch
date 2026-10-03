@@ -1,0 +1,1207 @@
+TOPPO modifications to MimicKit (https://github.com/xbpeng/MimicKit)
+Base commit: 2ed1e6c093bb0829f55d33cb4f7a1731cfe6cb69
+License: Apache-2.0 (the modified files remain under MimicKit's license)
+
+Eight upstream files are modified (+865 / -33 lines, git apply --numstat).
+Each modified file carries a two-line change notice at its top (Apache-2.0 4(b)).
+What each change does is described in CHANGES.md next to this directory.
+Files that are new in TOPPO are not in this patch; they are in overlay/.
+
+Apply from the root of a MimicKit checkout at 2ed1e6c:
+    git apply /path/to/0001-toppo-modifications-to-mimickit-2ed1e6c.patch
+
+diff --git a/mimickit/engines/newton_engine.py b/mimickit/engines/newton_engine.py
+index 80c641c6565673c603792af7d387851bbcfc2943..7c8f43b0adb2729577515f0a1cf0f8a535868591 100644
+--- a/mimickit/engines/newton_engine.py
++++ b/mimickit/engines/newton_engine.py
+@@ -1,6 +1,9 @@
++# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0).
++# The changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+ import warp as wp
+ wp.config.enable_backward = False
+ 
++import inspect
+ import newton
+ import numpy as np
+ import os
+@@ -1010,15 +1013,29 @@ class NewtonEngine(engine.Engine):
+         return
+ 
+     def _build_ground_contact_sensor(self):
+-        self._ground_contact_sensor = newton.sensors.SensorContact(self._sim_model,
+-                                                                   sensing_obj_bodies="*",
+-                                                                   counterpart_shapes="ground*",
+-                                                                   include_total=True,
+-                                                                   verbose=True)
++        sensor_kwargs = {
++            "sensing_obj_bodies": "*",
++            "counterpart_shapes": "ground*",
++            "verbose": True,
++        }
++        sensor_params = inspect.signature(newton.sensors.SensorContact.__init__).parameters
++        if ("include_total" in sensor_params):
++            sensor_kwargs["include_total"] = True
++        else:
++            sensor_kwargs["measure_total"] = True
++
++        self._ground_contact_sensor = newton.sensors.SensorContact(self._sim_model, **sensor_kwargs)
+         num_envs = self.get_num_envs()
+         num_objs = self.get_objs_per_env()
+-        ground_forces = wp.to_torch(self._ground_contact_sensor.net_force)
+-        ground_forces = ground_forces.view(num_envs, -1, 2, 3)
++        if (hasattr(self._ground_contact_sensor, "net_force")):
++            ground_forces = wp.to_torch(self._ground_contact_sensor.net_force)
++            ground_forces = ground_forces.view(num_envs, -1, 2, 3)
++        else:
++            total_force = wp.to_torch(self._ground_contact_sensor.total_force)
++            force_matrix = wp.to_torch(self._ground_contact_sensor.force_matrix)
++            ground_force = force_matrix[:, 0, :]
++            ground_forces = torch.stack([total_force, ground_force], dim=1)
++            ground_forces = ground_forces.view(num_envs, -1, 2, 3)
+ 
+         offset_idx = 0
+         self._contact_forces = []
+@@ -1206,4 +1223,4 @@ def exp_map_to_quat_indexed(in_dof: wp.array(dtype=float),
+     out_q[q_idx + 1] = q[1]
+     out_q[q_idx + 2] = q[2]
+     out_q[q_idx + 3] = q[3]
+-    return
+\ No newline at end of file
++    return
+diff --git a/mimickit/envs/base_env.py b/mimickit/envs/base_env.py
+index 683edd2aa131f63027378c61f6e357ec8d33fff1..83117337215e0ed64376e9849cc7948bd94926c9 100644
+--- a/mimickit/envs/base_env.py
++++ b/mimickit/envs/base_env.py
+@@ -1,3 +1,5 @@
++# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0).
++# The changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+ import abc
+ import enum
+ import gymnasium.spaces as spaces
+@@ -66,4 +68,7 @@ class BaseEnv(abc.ABC):
+         return 0.0
+     
+     def record_diagnostics(self):
+-        return self._diagnostics
+\ No newline at end of file
++        return self._diagnostics
++
++    def get_eval_metrics(self):
++        return dict()
+diff --git a/mimickit/envs/task_steering_env.py b/mimickit/envs/task_steering_env.py
+index 1dae167631f0d6a0793f5d7f4782df03bbf1bb98..c98f23acc7998db9a88406cd1b0b8927b2a6d4d6 100644
+--- a/mimickit/envs/task_steering_env.py
++++ b/mimickit/envs/task_steering_env.py
+@@ -1,7 +1,10 @@
++# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0).
++# The changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+ import torch
+ import numpy as np
+ 
+ import envs.smp_env as smp_env
++import envs.base_env as base_env
+ import engines.engine as engine
+ import util.torch_util as torch_util
+ 
+@@ -19,6 +22,12 @@ class TaskSteeringEnv(smp_env.SMPEnv):
+         self._reward_steering_face_w = float(env_config["reward_steering_face_w"])
+ 
+         self._reward_steering_vel_scale = float(env_config["reward_steering_vel_scale"])
++        self._min_root_height = env_config.get("min_root_height", None)
++        if (self._min_root_height is not None):
++            self._min_root_height = float(self._min_root_height)
++        self._min_root_upright = env_config.get("min_root_upright", None)
++        if (self._min_root_upright is not None):
++            self._min_root_upright = float(self._min_root_upright)
+ 
+         super().__init__(env_config=env_config, engine_config=engine_config,
+                          num_envs=num_envs, device=device, visualize=visualize,
+@@ -239,6 +248,65 @@ class TaskSteeringEnv(smp_env.SMPEnv):
+                                                       tar_reward_w=self._reward_steering_tar_w,
+                                                       face_reward_w=self._reward_steering_face_w)
+         return
++
++    def _update_done(self):
++        super()._update_done()
++        if (self._min_root_height is not None or self._min_root_upright is not None):
++            char_id = self._get_char_id()
++            root_pos = self._engine.get_root_pos(char_id)
++            root_rot = self._engine.get_root_rot(char_id)
++            failed = torch.zeros_like(self._done_buf, dtype=torch.bool)
++            if (self._min_root_height is not None):
++                failed = failed | (root_pos[..., 2] < self._min_root_height)
++            if (self._min_root_upright is not None):
++                up_dir = torch.zeros_like(root_pos)
++                up_dir[..., 2] = 1.0
++                root_up = torch_util.quat_rotate(root_rot, up_dir)
++                failed = failed | (root_up[..., 2] < self._min_root_upright)
++            failed = failed & (self._time_buf > 0.0)
++            self._done_buf[failed] = base_env.DoneFlags.FAIL.value
++        return
++
++    def get_eval_metrics(self):
++        char_id = self._get_char_id()
++        root_pos = self._engine.get_root_pos(char_id)
++        root_rot = self._engine.get_root_rot(char_id)
++        delta_root_pos = root_pos - self._prev_root_pos
++        root_vel = delta_root_pos / self._engine.get_timestep()
++
++        target_velocity = self._tar_speed.unsqueeze(-1) * self._tar_dir
++        target_velocity_error = torch.linalg.vector_norm(
++            target_velocity - root_vel[..., 0:2], dim=-1
++        )
++        projected_speed = torch.sum(self._tar_dir * root_vel[..., 0:2], dim=-1)
++
++        heading_rot = torch_util.calc_heading_quat(root_rot)
++        facing_dir = torch.zeros_like(root_pos)
++        facing_dir[..., 0] = 1.0
++        facing_dir = torch_util.quat_rotate(heading_rot, facing_dir)
++        facing_alignment = torch.sum(self._face_dir * facing_dir[..., 0:2], dim=-1)
++
++        up_dir = torch.zeros_like(root_pos)
++        up_dir[..., 2] = 1.0
++        root_up = torch_util.quat_rotate(root_rot, up_dir)
++
++        metrics = {
++            "target_velocity_error": target_velocity_error,
++            "target_speed_error": torch.abs(self._tar_speed - projected_speed),
++            "target_projected_speed": projected_speed,
++            "facing_alignment": facing_alignment,
++            "root_height": root_pos[..., 2],
++            "root_upright": root_up[..., 2],
++        }
++        if (self._min_root_height is not None):
++            metrics["root_height_violation"] = (
++                root_pos[..., 2] < self._min_root_height
++            ).float()
++        if (self._min_root_upright is not None):
++            metrics["root_upright_violation"] = (
++                root_up[..., 2] < self._min_root_upright
++            ).float()
++        return metrics
+     
+     def _update_misc(self):
+         super()._update_misc()
+diff --git a/mimickit/learning/agent_builder.py b/mimickit/learning/agent_builder.py
+index fe9ec2f4c14fa7a238a10310ac7d615421fd06f2..a0f4fb82a1d43cc7dda7ac992be1fdfbb232989d 100644
+--- a/mimickit/learning/agent_builder.py
++++ b/mimickit/learning/agent_builder.py
+@@ -1,3 +1,5 @@
++# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0).
++# The changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+ import yaml
+ 
+ from util.logger import Logger
+@@ -23,6 +25,15 @@ def build_agent(agent_file, env, device):
+     elif (agent_name == "AMP"):
+         import learning.amp_agent as amp_agent
+         agent = amp_agent.AMPAgent(config=agent_config, env=env, device=device)
++    elif (agent_name == "W5AMP"):
++        import learning.w5_amp_agent as w5_amp_agent
++        agent = w5_amp_agent.W5AMPAgent(config=agent_config, env=env, device=device)
++    elif (agent_name == "SAC"):
++        import learning.sac_agent as sac_agent
++        agent = sac_agent.SACAgent(config=agent_config, env=env, device=device)
++    elif (agent_name == "AMPSAC"):
++        import learning.amp_sac_agent as amp_sac_agent
++        agent = amp_sac_agent.AMPSACAgent(config=agent_config, env=env, device=device)
+     elif (agent_name == "SMP"):
+         import learning.smp_agent as smp_agent
+         agent = smp_agent.SMPAgent(config=agent_config, env=env, device=device)
+diff --git a/mimickit/learning/amp_agent.py b/mimickit/learning/amp_agent.py
+index 755f260a22ac5f265b4989733a2c2c509a30ffbb..bb128b9d202c3fecd1dcd2eebd08143ccd0d538f 100644
+--- a/mimickit/learning/amp_agent.py
++++ b/mimickit/learning/amp_agent.py
+@@ -1,7 +1,11 @@
++# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0).
++# The changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+ import numpy as np
+ import torch
+ 
++import envs.base_env as base_env
+ import learning.amp_model as amp_model
++import learning.eval_util as eval_util
+ import learning.experience_buffer as experience_buffer
+ import learning.mp_optimizer as mp_optimizer
+ import learning.normalizer as normalizer
+@@ -11,8 +15,162 @@ import util.torch_util as torch_util
+ class AMPAgent(ppo_agent.PPOAgent):
+     def __init__(self, config, env, device):
+         super().__init__(config, env, device)
++        self._detailed_eval = False
++        self._style_eval_samples = 8192
++        self._style_projection_dim = 64
++        self._style_eval_seed = 260511701
++        self._last_eval_records = None
+         return
+ 
++    def set_detailed_eval(
++        self,
++        enabled,
++        style_samples=8192,
++        style_projection_dim=64,
++        style_seed=260511701,
++    ):
++        self._detailed_eval = bool(enabled)
++        self._style_eval_samples = max(int(style_samples), 0)
++        self._style_projection_dim = max(int(style_projection_dim), 1)
++        self._style_eval_seed = int(style_seed)
++        return
++
++    def _rollout_test(self, num_episodes):
++        self._last_eval_records = None
++        if (not self._detailed_eval):
++            return super()._rollout_test(num_episodes)
++
++        if (num_episodes == 0):
++            return {
++                "mean_return": 0.0,
++                "mean_ep_len": 0.0,
++                "num_eps": 0,
++            }
++
++        num_envs = self.get_num_envs()
++        episodes_per_env = int(np.ceil(num_episodes / num_envs))
++        episode_stats = eval_util.EpisodeStats(
++            ["task_return", "disc_return", "amp_return"],
++            num_envs=num_envs,
++            device=self._device,
++        )
++        step_moments = eval_util.TensorMoments()
++        terminal_moments = eval_util.TensorMoments()
++        style_reservoir = eval_util.FeatureReservoir(
++            self._style_eval_samples,
++            seed=self._style_eval_seed,
++            device=self._device,
++        )
++        demo_style_pool = None
++        if (self._style_eval_samples > 0):
++            demo_style_pool = self._env.fetch_disc_obs_demo(
++                self._style_eval_samples
++            ).detach().cpu()
++        self._test_return_tracker.reset()
++
++        while True:
++            active = episode_stats.get_eps_per_env() < episodes_per_env
++            action, action_info = self._decide_action(self._curr_obs, self._curr_info)
++            next_obs, task_reward, done, next_info = self._step_env(action)
++
++            disc_obs = next_info["disc_obs"]
++            norm_disc_obs = self._disc_obs_norm.normalize(disc_obs)
++            disc_inputs = {"disc_obs": norm_disc_obs}
++            disc_logits = torch_util.eval_minibatch(
++                self._model.eval_disc, disc_inputs, self._disc_eval_batch_size
++            ).squeeze(-1)
++            disc_probability = torch.sigmoid(disc_logits)
++            disc_reward = -torch.log(torch.clamp(1.0 - disc_probability, min=0.0001))
++            disc_reward *= self._disc_reward_scale
++            amp_reward = (
++                self._task_reward_weight * task_reward
++                + self._disc_reward_weight * disc_reward
++            )
++
++            rewards = torch.stack([task_reward, disc_reward, amp_reward], dim=-1)
++            episode_stats.update(rewards, done, active_mask=active)
++
++            tracked_reward = torch.where(active, task_reward, torch.zeros_like(task_reward))
++            tracked_done = torch.where(
++                active, done, torch.full_like(done, base_env.DoneFlags.NULL.value)
++            )
++            self._test_return_tracker.update(tracked_reward, tracked_done)
++
++            env_metrics = self._env.get_eval_metrics()
++            step_metrics = dict(env_metrics)
++            step_metrics["disc_policy_probability"] = disc_probability
++            step_metrics["disc_policy_logit"] = disc_logits
++            step_moments.update(step_metrics, mask=active)
++
++            terminal_mask = active & (done != base_env.DoneFlags.NULL.value)
++            terminal_moments.update(env_metrics, mask=terminal_mask)
++
++            style_reservoir.add(disc_obs, mask=active)
++
++            needs_more_episodes = episode_stats.get_eps_per_env() < episodes_per_env
++            reset_done = torch.where(
++                needs_more_episodes,
++                done,
++                torch.full_like(done, base_env.DoneFlags.NULL.value),
++            )
++            if (torch.any(reset_done != base_env.DoneFlags.NULL.value)):
++                self._curr_obs, self._curr_info = self._reset_done_envs(reset_done)
++            else:
++                self._curr_obs, self._curr_info = next_obs, next_info
++            if (torch.all(episode_stats.get_eps_per_env() >= episodes_per_env)):
++                break
++
++        test_info = {
++            "mean_return": episode_stats.get_metric_stats("task_return")["mean"],
++            "mean_ep_len": episode_stats.get_mean_ep_len(),
++            "num_eps": episode_stats.get_episodes(),
++            "episodes_per_env": episodes_per_env,
++            "fall_rate": episode_stats.get_done_rate(base_env.DoneFlags.FAIL),
++            "timeout_rate": episode_stats.get_done_rate(base_env.DoneFlags.TIME),
++            "native_success_rate": episode_stats.get_done_rate(base_env.DoneFlags.SUCC),
++        }
++        test_info["survival_rate"] = test_info["timeout_rate"] + test_info["native_success_rate"]
++
++        for metric_name in episode_stats.metric_names:
++            metric_stats = episode_stats.get_metric_stats(metric_name)
++            for stat_name, value in metric_stats.items():
++                test_info[f"{metric_name}_{stat_name}"] = value
++
++        test_info.update(step_moments.summary("step"))
++        test_info.update(terminal_moments.summary("terminal"))
++
++        policy_obs = style_reservoir.values()
++        if (policy_obs.shape[0] > 0):
++            assert(demo_style_pool is not None)
++            policy_obs = policy_obs.cpu()
++            demo_obs = demo_style_pool[:policy_obs.shape[0]]
++            style_info = eval_util.compute_style_distribution_metrics(
++                policy_obs,
++                demo_obs,
++                projection_dim=self._style_projection_dim,
++                seed=self._style_eval_seed,
++            )
++            test_info.update(style_info)
++
++            demo_obs_device = demo_obs.to(self._device)
++            norm_demo_obs = self._disc_obs_norm.normalize(demo_obs_device)
++            demo_inputs = {"disc_obs": norm_demo_obs}
++            demo_logits = torch_util.eval_minibatch(
++                self._model.eval_disc, demo_inputs, self._disc_eval_batch_size
++            ).squeeze(-1)
++            demo_probability = torch.sigmoid(demo_logits)
++            demo_reward = -torch.log(torch.clamp(1.0 - demo_probability, min=0.0001))
++            demo_reward *= self._disc_reward_scale
++            test_info["disc_demo_probability_mean"] = float(demo_probability.mean().item())
++            test_info["disc_demo_reward_mean"] = float(demo_reward.mean().item())
++            test_info["style_stream_observations"] = style_reservoir.seen
++
++        self._last_eval_records = episode_stats.get_episode_records()
++        return test_info
++
++    def get_last_eval_records(self):
++        return self._last_eval_records
++
+     def _load_params(self, config):
+         super()._load_params(config)
+         
+@@ -29,7 +187,12 @@ class AMPAgent(ppo_agent.PPOAgent):
+         return
+ 
+     def _build_model(self, config):
+-        model_config = config["model"]
++        model_config = dict(config["model"])
++        if ("toppo" in config):
++            model_config["toppo"] = dict(config["toppo"])
++            # AMP stores weighted reward components, so the scalar value is
++            # the unweighted sum of the component critics.
++            model_config["toppo"]["value_weights"] = [1.0] * int(model_config["toppo"]["num_tasks"])
+         self._model = amp_model.AMPModel(model_config, self._env)
+         return
+     
+@@ -122,7 +285,13 @@ class AMPAgent(ppo_agent.PPOAgent):
+         disc_r = self._calc_disc_rewards(norm_disc_obs)
+         disc_reward_std, disc_reward_mean = torch.std_mean(disc_r)
+ 
+-        r = self._task_reward_weight * task_r + self._disc_reward_weight * disc_r
++        task_component = self._task_reward_weight * task_r
++        disc_component = self._disc_reward_weight * disc_r
++        if (self._toppo_enabled):
++            reward_components = torch.stack([task_component, disc_component], dim=-1)
++            self._exp_buffer.set_data_flat("toppo_reward_components", reward_components)
++
++        r = task_component + disc_component
+         self._exp_buffer.set_data_flat("reward", r)
+         
+         info = {
+@@ -130,6 +299,13 @@ class AMPAgent(ppo_agent.PPOAgent):
+             "disc_reward_std": disc_reward_std
+         }
+         return info
++
++    def _get_toppo_terminal_values(self):
++        succ, fail = super()._get_toppo_terminal_values()
++        if (self._toppo_num_tasks > 0):
++            succ[0] = self._task_reward_weight * self._compute_succ_val()
++            fail[0] = self._task_reward_weight * self._compute_fail_val()
++        return succ, fail
+     
+     def _update_model(self):
+         info = super()._update_model()
+@@ -246,4 +422,4 @@ class AMPAgent(ppo_agent.PPOAgent):
+             prob = 1 / (1 + torch.exp(-disc_logits)) 
+             disc_r = -torch.log(torch.maximum(1 - prob, torch.tensor(0.0001, device=self._device)))
+             disc_r *= self._disc_reward_scale
+-        return disc_r
+\ No newline at end of file
++        return disc_r
+diff --git a/mimickit/learning/ppo_agent.py b/mimickit/learning/ppo_agent.py
+index 45ab4d0962b35ac422b744edf04abaa989bebf96..64f380db7ff4497a6e194d40862c7d271b059cc6 100644
+--- a/mimickit/learning/ppo_agent.py
++++ b/mimickit/learning/ppo_agent.py
+@@ -1,3 +1,5 @@
++# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0).
++# The changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+ import numpy as np
+ import torch
+ 
+@@ -6,6 +8,7 @@ import learning.base_agent as base_agent
+ import learning.mp_optimizer as mp_optimizer
+ import learning.ppo_model as ppo_model
+ import learning.rl_util as rl_util
++import learning.toppo as toppo
+ import util.mp_util as mp_util
+ import util.torch_util as torch_util
+ 
+@@ -35,10 +38,37 @@ class PPOAgent(base_agent.BaseAgent):
+         self._exp_anneal_samples = config.get("exp_anneal_samples", np.inf)
+         self._exp_prob_beg = config.get("exp_prob_beg", 1.0)
+         self._exp_prob_end = config.get("exp_prob_end", 1.0)
++
++        toppo_config = config.get("toppo", {})
++        self._toppo_enabled = bool(toppo_config.get("enabled", False))
++        self._toppo_num_tasks = int(toppo_config.get("num_tasks", 0))
++        self._toppo_task_names = list(toppo_config.get(
++            "task_names", [f"component_{i}" for i in range(self._toppo_num_tasks)]
++        ))
++        self._toppo_actor_method = toppo_config.get("actor_method", "pcgrad")
++        self._toppo_critic_method = toppo_config.get("critic_method", "fairgrad")
++        self._toppo_actor_components = bool(toppo_config.get("actor_components", True))
++        self._toppo_fairgrad_alpha = float(toppo_config.get("fairgrad_alpha", 1.0))
++        self._toppo_fairgrad_rescale = bool(toppo_config.get("fairgrad_rescale", False))
++        # Post-combine critic gradient scale (vf_coef). A loss-level coefficient is a
++        # no-op under scale-invariant FairGrad (alpha=1), so it is re-armed here, after
++        # the combiner. 1.0 keeps prior runs byte-identical.
++        self._toppo_critic_coef = float(toppo_config.get("critic_coef", 1.0))
++        valid_toppo_methods = {"default", "pcgrad", "fairgrad"}
++        assert(self._toppo_actor_method in valid_toppo_methods), \
++            f"Unsupported TOPPO actor_method: {self._toppo_actor_method}"
++        assert(self._toppo_critic_method in valid_toppo_methods), \
++            f"Unsupported TOPPO critic_method: {self._toppo_critic_method}"
++        if (self._toppo_enabled):
++            assert(self._toppo_num_tasks > 0), "TOPPO requires num_tasks > 0."
++            assert(len(self._toppo_task_names) == self._toppo_num_tasks), \
++                "TOPPO task_names length must match num_tasks."
+         return
+ 
+     def _build_model(self, config):
+-        model_config = config["model"]
++        model_config = dict(config["model"])
++        if ("toppo" in config):
++            model_config["toppo"] = dict(config["toppo"])
+         self._model = ppo_model.PPOModel(model_config, self._env)
+         return
+     
+@@ -150,7 +180,84 @@ class PPOAgent(base_agent.BaseAgent):
+             "adv_mean": adv_mean,
+             "adv_std": adv_std
+         }
++        if (self._toppo_enabled):
++            toppo_info = self._build_toppo_train_data(
++                done=done,
++                rand_action_mask=rand_action_mask,
++                norm_obs=norm_obs,
++                norm_next_obs=norm_next_obs,
++            )
++            info = {**info, **toppo_info}
++        return info
++
++    def _build_toppo_train_data(self, done, rand_action_mask, norm_obs, norm_next_obs):
++        assert("toppo_reward_components" in self._exp_buffer._buffers), \
++            "TOPPO is enabled, but no toppo_reward_components buffer was recorded."
++
++        reward_components = self._exp_buffer.get_data("toppo_reward_components")
++        assert(reward_components.shape[-1] == self._toppo_num_tasks), \
++            "TOPPO reward component count does not match config."
++
++        critic_inputs = {"obs": norm_next_obs}
++        next_vals = torch_util.eval_minibatch(
++            self._model.eval_toppo_critic_components,
++            critic_inputs,
++            self._critic_eval_batch_size,
++        )
++        next_vals = next_vals.detach()
++
++        succ_vals, fail_vals = self._get_toppo_terminal_values()
++        succ_mask = (done == base_env.DoneFlags.SUCC.value)
++        fail_mask = (done == base_env.DoneFlags.FAIL.value)
++        next_vals[succ_mask] = succ_vals.to(dtype=next_vals.dtype, device=next_vals.device)
++        next_vals[fail_mask] = fail_vals.to(dtype=next_vals.dtype, device=next_vals.device)
++
++        returns = []
++        for i in range(self._toppo_num_tasks):
++            comp_ret = rl_util.compute_td_lambda_return(
++                reward_components[..., i],
++                next_vals[..., i],
++                done,
++                self._discount,
++                self._td_lambda,
++            )
++            returns.append(comp_ret)
++        returns = torch.stack(returns, dim=-1)
++
++        self._model.update_toppo_popart(returns.reshape(-1, self._toppo_num_tasks))
++
++        critic_inputs = {"obs": norm_obs}
++        vals = torch_util.eval_minibatch(
++            self._model.eval_toppo_critic_components,
++            critic_inputs,
++            self._critic_eval_batch_size,
++        )
++        vals = vals.detach()
++        adv = returns - vals
++
++        flat_mask = (rand_action_mask == 1.0).flatten()
++        flat_adv = adv.reshape(-1, self._toppo_num_tasks)
++        if (torch.sum(flat_mask) > 1):
++            adv_mean, adv_std = mp_util.calc_mean_std(flat_adv[flat_mask], dim=0)
++        else:
++            adv_mean = torch.mean(flat_adv, dim=0)
++            adv_std = torch.ones_like(adv_mean)
++        norm_adv = (adv - adv_mean) / torch.clamp_min(adv_std, 1e-5)
++        norm_adv = torch.clamp(norm_adv, -self._norm_adv_clip, self._norm_adv_clip)
++
++        self._exp_buffer.set_data("toppo_tar_val", returns)
++        self._exp_buffer.set_data("toppo_adv", norm_adv)
++
++        info = {}
++        for i, name in enumerate(self._toppo_task_names):
++            info[f"toppo_return_mean_{name}"] = torch.mean(returns[..., i]).detach()
++            info[f"toppo_adv_std_{name}"] = torch.std(norm_adv[..., i]).detach()
+         return info
++
++    def _get_toppo_terminal_values(self):
++        succ = torch.zeros(self._toppo_num_tasks, device=self._device, dtype=torch.float32)
++        fail = torch.zeros(self._toppo_num_tasks, device=self._device, dtype=torch.float32)
++        return succ, fail
+     
+     def _get_exp_prob(self):
+         if (np.isfinite(self._exp_anneal_samples)):
+@@ -189,10 +296,25 @@ class PPOAgent(base_agent.BaseAgent):
+             batch = self._exp_buffer.sample(batch_size)
+ 
+             with torch.amp.autocast(device_type=device_type, enabled=self._use_mixed_precision, dtype=torch.bfloat16):
+-                loss_info = self._compute_critic_loss(batch)
++                if (self._toppo_enabled):
++                    loss_info = self._compute_toppo_critic_loss(batch)
++                else:
++                    loss_info = self._compute_critic_loss(batch)
++
++            if (self._toppo_enabled):
++                task_losses = loss_info.pop("toppo_task_losses")
++                self._toppo_optimizer_step(
++                    optimizer=self._critic_optimizer,
++                    task_losses=task_losses,
++                    method=self._toppo_critic_method,
++                    diag_prefix="toppo_critic",
++                    info=loss_info,
++                    scope_params=self._model.get_toppo_critic_shared_params(),
++                    grad_scale=self._toppo_critic_coef,
++                )
++            else:
+                 loss = loss_info["critic_loss"]
+-
+-            self._critic_optimizer.step(loss)
++                self._critic_optimizer.step(loss)
+ 
+             torch_util.add_torch_dict(loss_info, info)
+         
+@@ -202,20 +324,56 @@ class PPOAgent(base_agent.BaseAgent):
+     def _update_actor(self, batch_size, num_steps):
+         info = dict()
+         device_type = torch.device(self._device).type
++        use_toppo_actor = self._toppo_enabled and self._toppo_actor_components
+ 
+         for i in range(num_steps):
+             batch = self._exp_buffer.sample(batch_size)
+ 
+             with torch.amp.autocast(device_type=device_type, enabled=self._use_mixed_precision, dtype=torch.bfloat16):
+-                loss_info = self._compute_actor_loss(batch)
++                if (use_toppo_actor):
++                    loss_info = self._compute_toppo_actor_loss(batch)
++                else:
++                    loss_info = self._compute_actor_loss(batch)
++
++            if (use_toppo_actor):
++                task_losses = loss_info.pop("toppo_task_losses")
++                self._toppo_optimizer_step(
++                    optimizer=self._actor_optimizer,
++                    task_losses=task_losses,
++                    method=self._toppo_actor_method,
++                    diag_prefix="toppo_actor",
++                    info=loss_info,
++                    scope_params=None,
++                )
++            else:
+                 loss = loss_info["actor_loss"]
+-
+-            self._actor_optimizer.step(loss)
++                self._actor_optimizer.step(loss)
+ 
+             torch_util.add_torch_dict(loss_info, info)
+         
+         torch_util.scale_torch_dict(1.0 / num_steps, info)
+         return info
++
++    def _compute_toppo_critic_loss(self, batch):
++        norm_obs = self._obs_norm.normalize(batch["obs"])
++        tar_val = batch["toppo_tar_val"]
++        pred = self._model.eval_toppo_critic_components(
++            norm_obs,
++            normalized=self._model.uses_toppo_popart(),
++        )
++        tar = self._model.normalize_toppo_value_targets(tar_val)
++
++        diff = tar - pred
++        task_losses = [torch.mean(torch.square(diff[:, i])) for i in range(self._toppo_num_tasks)]
++        loss = torch.mean(torch.stack(task_losses))
++
++        info = {
++            "critic_loss": loss,
++            "toppo_task_losses": task_losses,
++        }
++        for i, name in enumerate(self._toppo_task_names):
++            info[f"toppo_critic_loss_{name}"] = task_losses[i].detach()
++        return info
+     
+     def _compute_critic_loss(self, batch):
+         norm_obs = self._obs_norm.normalize(batch["obs"])
+@@ -231,6 +389,216 @@ class PPOAgent(base_agent.BaseAgent):
+         }
+         return info
+ 
++    def _compute_toppo_actor_loss(self, batch):
++        norm_obs = self._obs_norm.normalize(batch["obs"])
++        norm_a = self._a_norm.normalize(batch["action"])
++        old_a_logp = batch["a_logp"]
++        adv = batch["toppo_adv"]
++        rand_action_mask = batch["rand_action_mask"]
++
++        rand_action_mask = (rand_action_mask == 1.0)
++        norm_obs = norm_obs[rand_action_mask]
++        norm_a = norm_a[rand_action_mask]
++        old_a_logp = old_a_logp[rand_action_mask]
++        adv = adv[rand_action_mask]
++
++        if (norm_obs.shape[0] == 0):
++            zero = toppo.make_zero_loss(self._model.get_actor_params()).to(self._device)
++            task_losses = [zero for _ in range(self._toppo_num_tasks)]
++            return {
++                "actor_loss": zero.detach(),
++                "clip_frac": torch.tensor(0.0, device=self._device),
++                "imp_ratio": torch.tensor(1.0, device=self._device),
++                "toppo_task_losses": task_losses,
++            }
++
++        a_dist = self._model.eval_actor(norm_obs)
++        a_logp = a_dist.log_prob(norm_a)
++
++        a_ratio = torch.exp(a_logp - old_a_logp)
++        clip_ratio = torch.clamp(a_ratio, 1.0 - self._ppo_clip_ratio, 1.0 + self._ppo_clip_ratio)
++        task_losses = []
++        for i in range(self._toppo_num_tasks):
++            curr_adv = adv[:, i]
++            loss0 = curr_adv * a_ratio
++            loss1 = curr_adv * clip_ratio
++            curr_loss = -torch.mean(torch.minimum(loss0, loss1))
++            task_losses.append(curr_loss)
++
++        clip_frac = (torch.abs(a_ratio - 1.0) > self._ppo_clip_ratio).type(torch.float)
++        clip_frac = torch.mean(clip_frac)
++        imp_ratio = torch.mean(a_ratio)
++
++        actor_loss = torch.mean(torch.stack(task_losses))
++        info = {
++            "actor_loss": actor_loss,
++            "clip_frac": clip_frac.detach(),
++            "imp_ratio": imp_ratio.detach(),
++            "toppo_task_losses": task_losses,
++        }
++
++        regularizer = None
++        if (self._action_bound_weight != 0):
++            action_bound_loss = self._compute_action_bound_loss(a_dist)
++            if (action_bound_loss is not None):
++                action_bound_loss = torch.mean(action_bound_loss)
++                regularizer = self._add_regularizer(regularizer, self._action_bound_weight * action_bound_loss)
++                info["action_bound_loss"] = action_bound_loss.detach()
++
++        if (self._action_entropy_weight != 0):
++            action_entropy = a_dist.entropy()
++            action_entropy = torch.mean(action_entropy)
++            regularizer = self._add_regularizer(regularizer, -self._action_entropy_weight * action_entropy)
++            info["action_entropy"] = action_entropy.detach()
++
++        if (self._action_reg_weight != 0):
++            action_reg_loss = a_dist.param_reg()
++            action_reg_loss = torch.mean(action_reg_loss)
++            regularizer = self._add_regularizer(regularizer, self._action_reg_weight * action_reg_loss)
++            info["action_reg_loss"] = action_reg_loss.detach()
++
++        if (regularizer is not None):
++            task_losses = [loss + regularizer for loss in task_losses]
++            info["toppo_task_losses"] = task_losses
++        return info
++
++    def _add_regularizer(self, regularizer, term):
++        if (regularizer is None):
++            regularizer = term
++        else:
++            regularizer = regularizer + term
++        return regularizer
++
++    def _toppo_optimizer_step(self, optimizer, task_losses, method, diag_prefix, info,
++                              scope_params=None, grad_scale=1.0):
++        if (method == "default"):
++            # Under the plain mean combiner a loss-level scale is equivalent to a
++            # gradient scale, so apply grad_scale here directly.
++            loss = grad_scale * torch.mean(torch.stack(task_losses))
++            optimizer.step(loss)
++            return
++
++        params = optimizer._param_list
++        task_grads = self._compute_toppo_task_grads(optimizer, task_losses, params)
++        self._aggregate_toppo_task_grads(task_grads)
++        mean_flat_grad = torch.stack(task_grads).mean(dim=0)
++        if (scope_params is None):
++            scope_params = params
++        scope_param_ids = {id(p) for p in scope_params}
++        scoped_task_grads = [
++            self._select_toppo_flat_grad(grad, params, scope_param_ids)
++            for grad in task_grads
++        ]
++
++        if (method == "pcgrad"):
++            scoped_flat_grad, diag = toppo.pcgrad_combine(scoped_task_grads)
++            self._add_toppo_diag(info, diag.as_dict(diag_prefix))
++        elif (method == "fairgrad"):
++            scoped_flat_grad, diag = toppo.fairgrad_combine(
++                scoped_task_grads,
++                alpha=self._toppo_fairgrad_alpha,
++                rescale=self._toppo_fairgrad_rescale,
++            )
++            self._add_toppo_diag(info, diag.as_dict(diag_prefix, self._toppo_task_names))
++        else:
++            assert(False), f"Unsupported TOPPO optimizer method: {method}"
++
++        flat_grad = self._replace_toppo_flat_grad(
++            mean_flat_grad,
++            params,
++            scope_param_ids,
++            scoped_flat_grad,
++        )
++        # Re-arm the critic gradient magnitude post-combine, before clipping. Under
++        # FairGrad (alpha=1) the combined norm is pinned (~sqrt(num_tasks)) regardless
++        # of the loss scale, so this coefficient is the only way to set the effective
++        # critic step size.
++        if (grad_scale != 1.0):
++            flat_grad = flat_grad * grad_scale
++        info[f"{diag_prefix}_grad_scale"] = torch.tensor(
++            float(grad_scale), device=self._device, dtype=torch.float32
++        )
++        scoped_numel = scoped_flat_grad.numel()
++        info[f"{diag_prefix}_scope_fraction"] = torch.tensor(
++            float(scoped_numel) / max(flat_grad.numel(), 1),
++            device=self._device,
++        )
++        grad_info = self._step_optimizer_with_flat_grad(optimizer, flat_grad)
++        for key, value in grad_info.items():
++            info[f"{diag_prefix}_{key}"] = value
++        return
++
++    def _compute_toppo_task_grads(self, optimizer, task_losses, params):
++        task_grads = []
++        for i, loss in enumerate(task_losses):
++            optimizer._optimizer.zero_grad()
++            loss.backward(retain_graph=(i < len(task_losses) - 1))
++            task_grads.append(toppo.flatten_param_grads(params).clone())
++        return task_grads
++
++    def _aggregate_toppo_task_grads(self, task_grads):
++        if (mp_util.enable_mp()):
++            for grad in task_grads:
++                mp_util.reduce_inplace_mean(grad)
++        return
++
++    def _select_toppo_flat_grad(self, flat_grad, params, selected_param_ids):
++        chunks = []
++        offset = 0
++        for param in params:
++            numel = param.numel()
++            if (id(param) in selected_param_ids):
++                chunks.append(flat_grad[offset:offset + numel])
++            offset += numel
++        if (offset != flat_grad.numel()):
++            raise ValueError("Flat gradient size does not match optimizer parameters.")
++        if (len(chunks) == 0):
++            return torch.zeros(0, device=flat_grad.device, dtype=flat_grad.dtype)
++        return torch.cat(chunks)
++
++    def _replace_toppo_flat_grad(self, flat_grad, params, selected_param_ids, replacement):
++        result = flat_grad.clone()
++        flat_offset = 0
++        replacement_offset = 0
++        for param in params:
++            numel = param.numel()
++            if (id(param) in selected_param_ids):
++                result[flat_offset:flat_offset + numel] = replacement[
++                    replacement_offset:replacement_offset + numel
++                ]
++                replacement_offset += numel
++            flat_offset += numel
++        if (flat_offset != flat_grad.numel() or replacement_offset != replacement.numel()):
++            raise ValueError("Scoped gradient size does not match selected parameters.")
++        return result
++
++    def _step_optimizer_with_flat_grad(self, optimizer, flat_grad):
++        optimizer._optimizer.zero_grad()
++        toppo.set_flat_param_grads(optimizer._param_list, flat_grad)
++
++        pre_clip_norm = toppo.flatten_param_grads(optimizer._param_list).norm()
++        if (optimizer._enable_grad_clip()):
++            optimizer._clip_grads(optimizer._grad_clip)
++        post_clip_norm = toppo.flatten_param_grads(optimizer._param_list).norm()
++        clip_factor = post_clip_norm / torch.clamp_min(pre_clip_norm, 1e-12)
++
++        optimizer._optimizer.step()
++
++        if (mp_util.enable_mp() and (optimizer.get_steps() % optimizer.CHECK_SYNC_STEPS == 0)):
++            assert(optimizer._check_synced()), "Network parameters desynchronized"
++
++        optimizer._steps += 1
++        return {
++            "combined_grad_norm_pre_clip": pre_clip_norm.detach(),
++            "combined_grad_norm_post_clip": post_clip_norm.detach(),
++            "clip_factor": clip_factor.detach(),
++        }
++
++    def _add_toppo_diag(self, info, diag_dict):
++        for k, v in diag_dict.items():
++            info[k] = torch.tensor(v, device=self._device, dtype=torch.float32)
++        return
++
+     def _compute_actor_loss(self, batch):
+         norm_obs = self._obs_norm.normalize(batch["obs"])
+         norm_a = self._a_norm.normalize(batch["action"])
+@@ -288,4 +656,4 @@ class PPOAgent(base_agent.BaseAgent):
+     def _log_train_info(self, train_info, test_info, env_diag_info, start_time):
+         super()._log_train_info(train_info, test_info, env_diag_info, start_time)
+         self._logger.log("Exp_Prob", self._get_exp_prob())
+-        return
+\ No newline at end of file
++        return
+diff --git a/mimickit/learning/ppo_model.py b/mimickit/learning/ppo_model.py
+index 78fa96039e0b0bc4ef51666692191e643b2956d3..75ee31a59de2144470879cf5bac9bf5dd549f017 100644
+--- a/mimickit/learning/ppo_model.py
++++ b/mimickit/learning/ppo_model.py
+@@ -1,7 +1,10 @@
++# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0).
++# The changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
+ import torch
+ 
+ import learning.base_model as base_model
+ import learning.nets.net_builder as net_builder
++import learning.toppo as toppo
+ import util.torch_util as torch_util
+ 
+ class PPOModel(base_model.BaseModel):
+@@ -17,17 +20,56 @@ class PPOModel(base_model.BaseModel):
+         return a_dist
+     
+     def eval_critic(self, obs):
++        if (self._toppo_enabled):
++            vals = self.eval_toppo_critic_components(obs, normalized=False)
++            weights = self._toppo_value_weights.to(device=vals.device, dtype=vals.dtype)
++            return torch.sum(vals * weights, dim=-1, keepdim=True)
++
+         h = self._critic_layers(obs)
+         val = self._critic_out(h)
+         return val
++
++    def eval_toppo_critic_components(self, obs, normalized=False):
++        assert(self._toppo_enabled), "TOPPO critic components requested but TOPPO is disabled."
++        h = self._critic_layers(obs)
++        vals = self._toppo_critic_out(h)
++        if (self._toppo_use_popart):
++            vals = self._toppo_popart.affine(vals)
++            if (not normalized):
++                vals = self._toppo_popart.denormalize(vals)
++        return vals
++
++    def normalize_toppo_value_targets(self, targets):
++        assert(self._toppo_enabled), "TOPPO value targets requested but TOPPO is disabled."
++        if (self._toppo_use_popart):
++            targets = self._toppo_popart.normalize_target(targets)
++        return targets
++
++    def update_toppo_popart(self, targets):
++        if (self._toppo_enabled and self._toppo_use_popart):
++            self._toppo_popart.update_and_renormalize(targets)
++        return
++
++    def uses_toppo_popart(self):
++        return self._toppo_enabled and self._toppo_use_popart
+     
+     def get_actor_params(self):
+         params = list(self._actor_layers.parameters()) + list(self._action_dist.parameters())
+         return params
+     
+     def get_critic_params(self):
+-        params = list(self._critic_layers.parameters()) + list(self._critic_out.parameters())
++        params = list(self._critic_layers.parameters())
++        if (self._toppo_enabled):
++            params += list(self._toppo_critic_out.parameters())
++            if (self._toppo_use_popart):
++                params += list(self._toppo_popart.parameters())
++        else:
++            params += list(self._critic_out.parameters())
+         return params
++
++    def get_toppo_critic_shared_params(self):
++        assert(self._toppo_enabled), "TOPPO critic scope requested but TOPPO is disabled."
++        return list(self._critic_layers.parameters())
+     
+     def _build_nets(self, config, env):
+         self._build_actor(config, env)
+@@ -43,16 +85,55 @@ class PPOModel(base_model.BaseModel):
+         return
+     
+     def _build_critic(self, config, env):
++        toppo_config = config.get("toppo", {})
++        self._toppo_enabled = bool(toppo_config.get("enabled", False))
++        self._toppo_num_tasks = int(toppo_config.get("num_tasks", 0))
++        self._toppo_use_popart = bool(toppo_config.get("use_popart", False))
++
+         net_name = config["critic_net"]
+         input_dict = self._build_critic_input_dict(env)
+         self._critic_layers, layers_info = net_builder.build_net(net_name, input_dict,
+                                                                  activation=self._activation)
++        if (bool(toppo_config.get("critic_layer_norm", False))):
++            biasless = bool(toppo_config.get("critic_layer_norm_biasless", True))
++            self._critic_layers = self._add_layer_norm(
++                self._critic_layers,
++                biasless=biasless,
++            )
+ 
+         layers_out_size = torch_util.calc_layers_out_size(self._critic_layers)
+-        self._critic_out = torch.nn.Linear(layers_out_size, 1)
+-        torch.nn.init.zeros_(self._critic_out.bias)
++        if (self._toppo_enabled):
++            assert(self._toppo_num_tasks > 0), "TOPPO requires num_tasks > 0."
++            self._toppo_critic_out = torch.nn.Linear(layers_out_size, self._toppo_num_tasks)
++            torch.nn.init.zeros_(self._toppo_critic_out.bias)
++
++            value_weights = toppo_config.get("value_weights", [1.0] * self._toppo_num_tasks)
++            assert(len(value_weights) == self._toppo_num_tasks), "TOPPO value_weights must match num_tasks."
++            self.register_buffer("_toppo_value_weights", torch.tensor(value_weights, dtype=torch.float32))
++
++            if (self._toppo_use_popart):
++                self._toppo_popart = toppo.ComponentPopArt(
++                    self._toppo_num_tasks,
++                    min_std=float(toppo_config.get("popart_min_std", 1e-2)),
++                    method=toppo_config.get("popart_method", "welford"),
++                    ema_decay=float(toppo_config.get("popart_ema_decay", 3e-4)),
++                )
++            self._critic_out = None
++        else:
++            self._critic_out = torch.nn.Linear(layers_out_size, 1)
++            torch.nn.init.zeros_(self._critic_out.bias)
+         return
+ 
++    def _add_layer_norm(self, layers, biasless=True):
++        new_layers = []
++        for layer in layers.children():
++            if (biasless and isinstance(layer, torch.nn.Linear)):
++                layer.bias = None
++            new_layers.append(layer)
++            if (isinstance(layer, torch.nn.Linear)):
++                new_layers.append(torch.nn.LayerNorm(layer.out_features))
++        return torch.nn.Sequential(*new_layers)
++
+     def _build_actor_input_dict(self, env):
+         obs_space = env.get_obs_space()
+         input_dict = {"obs": obs_space}
+@@ -61,4 +142,4 @@ class PPOModel(base_model.BaseModel):
+     def _build_critic_input_dict(self, env):
+         obs_space = env.get_obs_space()
+         input_dict = {"obs": obs_space}
+-        return input_dict
+\ No newline at end of file
++        return input_dict
+diff --git a/mimickit/run.py b/mimickit/run.py
+index bceff921a917c8c050047142512da1b7b22c90d5..808bad527190789869439794036187c2789b81bd 100644
+--- a/mimickit/run.py
++++ b/mimickit/run.py
+@@ -1,5 +1,11 @@
++# Modified by the TOPPO authors, 2026, from MimicKit @ 2ed1e6c (Apache-2.0).
++# The changes are listed in experiments/amp_humanoid/CHANGES.md of the TOPPO release.
++import hashlib
++import importlib.metadata as package_metadata
++import json
+ import numpy as np
+ import os
++import platform
+ import shutil
+ import sys
+ import time
+@@ -13,6 +19,47 @@ import util.util as util
+ 
+ import torch
+ 
++
++def _sha256_file(path):
++    if (path == "" or not os.path.isfile(path)):
++        return ""
++
++    digest = hashlib.sha256()
++    with open(path, "rb") as f:
++        for chunk in iter(lambda: f.read(1024 * 1024), b""):
++            digest.update(chunk)
++    return digest.hexdigest()
++
++
++def _package_versions():
++    versions = {}
++    for name in ["newton", "warp-lang", "mujoco", "mujoco-warp"]:
++        try:
++            versions[name] = package_metadata.version(name)
++        except package_metadata.PackageNotFoundError:
++            versions[name] = ""
++    return versions
++
++
++def _runtime_metadata(device):
++    device_name = ""
++    device_capability = ""
++    if (str(device).startswith("cuda") and torch.cuda.is_available()):
++        device_name = torch.cuda.get_device_name(device)
++        capability = torch.cuda.get_device_capability(device)
++        device_capability = "{}.{}".format(*capability)
++
++    return {
++        "cuda_version": torch.version.cuda or "",
++        "device": str(device),
++        "device_capability": device_capability,
++        "device_name": device_name,
++        "numpy_version": np.__version__,
++        "package_versions": _package_versions(),
++        "python_version": platform.python_version(),
++        "torch_version": torch.__version__,
++    }
++
+ def set_np_formatting():
+     np.set_printoptions(edgeitems=30, infstr='inf',
+                         linewidth=4000, nanstr='nan', precision=2,
+@@ -48,12 +95,32 @@ def train(agent, max_samples, out_dir, save_int_models, logger_type):
+                       save_int_models=save_int_models, logger_type=logger_type)
+     return
+ 
+-def test(agent, test_episodes):
++def test(agent, test_episodes, eval_output="", metadata=None):
+     result = agent.test_model(num_episodes=test_episodes)
+-    
+-    Logger.print("Mean Return: {}".format(result["mean_return"]))
+-    Logger.print("Mean Episode Length: {}".format(result["mean_ep_len"]))
+-    Logger.print("Episodes: {}".format(result["num_eps"]))
++
++    for key in sorted(result.keys()):
++        Logger.print("{}: {}".format(key, result[key]))
++
++    if (eval_output != "" and mp_util.is_root_proc()):
++        eval_dir = os.path.dirname(eval_output)
++        if (eval_dir != ""):
++            os.makedirs(eval_dir, exist_ok=True)
++        episode_data_file = ""
++        if (hasattr(agent, "get_last_eval_records")):
++            episode_records = agent.get_last_eval_records()
++            if (episode_records is not None):
++                episode_data_file = os.path.splitext(eval_output)[0] + ".episodes.npz"
++                np.savez_compressed(episode_data_file, **episode_records)
++        payload = {
++            "metadata": {} if metadata is None else metadata,
++            "metrics": result,
++        }
++        if (episode_data_file != ""):
++            payload["episode_data_file"] = episode_data_file
++        with open(eval_output, "w", encoding="utf-8") as f:
++            json.dump(payload, f, indent=2, sort_keys=True)
++            f.write("\n")
++        Logger.print("Evaluation results written to: {}".format(eval_output))
+     return result
+ 
+ def save_config_files(args, out_dir):
+@@ -92,7 +159,7 @@ def set_rand_seed(args):
+     rand_seed += np.uint64(41 * mp_util.get_proc_rank())
+     print("Setting seed: {}".format(rand_seed))
+     util.set_rand_seed(rand_seed)
+-    return
++    return int(rand_seed)
+ 
+ def run(rank, num_procs, device, master_port, args):
+     mode = args.parse_string("mode", "train")
+@@ -107,7 +174,7 @@ def run(rank, num_procs, device, master_port, args):
+ 
+     mp_util.init(rank, num_procs, device, master_port)
+ 
+-    set_rand_seed(args)
++    rand_seed = set_rand_seed(args)
+     set_np_formatting()
+     create_output_dir(out_dir)
+ 
+@@ -124,7 +191,46 @@ def run(rank, num_procs, device, master_port, args):
+         
+     elif (mode == "test"):
+         test_episodes = args.parse_int("test_episodes", np.iinfo(np.int64).max)
+-        test(agent=agent, test_episodes=test_episodes)
++        detailed_eval = args.parse_bool("detailed_eval", False)
++        if (hasattr(agent, "set_detailed_eval")):
++            style_samples = args.parse_int("style_samples", 8192)
++            style_projection_dim = args.parse_int("style_projection_dim", 64)
++            style_seed = args.parse_int("style_seed", 260511701)
++            agent.set_detailed_eval(
++                detailed_eval,
++                style_samples=style_samples,
++                style_projection_dim=style_projection_dim,
++                style_seed=style_seed,
++            )
++
++        eval_seed = args.parse_int("eval_seed", rand_seed)
++        print("Resetting evaluation seed: {}".format(eval_seed))
++        util.set_rand_seed(eval_seed)
++        eval_output = args.parse_string("eval_output", "")
++        metadata = {
++            "agent_config": args.parse_string("agent_config"),
++            "agent_config_sha256": _sha256_file(args.parse_string("agent_config")),
++            "detailed_eval": detailed_eval,
++            "engine_config": args.parse_string("engine_config"),
++            "engine_config_sha256": _sha256_file(args.parse_string("engine_config")),
++            "env_config": args.parse_string("env_config"),
++            "env_config_sha256": _sha256_file(args.parse_string("env_config")),
++            "eval_seed": eval_seed,
++            "model_file": model_file,
++            "model_sha256": _sha256_file(model_file),
++            "num_envs": num_envs,
++            "requested_episodes": test_episodes,
++            "runtime": _runtime_metadata(device),
++            "style_projection_dim": args.parse_int("style_projection_dim", 64),
++            "style_samples": args.parse_int("style_samples", 8192),
++            "style_seed": args.parse_int("style_seed", 260511701),
++        }
++        test(
++            agent=agent,
++            test_episodes=test_episodes,
++            eval_output=eval_output,
++            metadata=metadata,
++        )
+ 
+     else:
+         assert(False), "Unsupported mode: {}".format(mode)
+@@ -162,4 +268,4 @@ def main(argv):
+     return
+ 
+ if __name__ == "__main__":
+-    main(sys.argv)
+\ No newline at end of file
++    main(sys.argv)

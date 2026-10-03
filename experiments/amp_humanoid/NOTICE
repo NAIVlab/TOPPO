@@ -1,0 +1,60 @@
+TOPPO: AMP humanoid experiments (experiments/amp_humanoid)
+Copyright 2026 the TOPPO authors
+
+This directory is a modification and extension of MimicKit and is distributed under the
+Apache License, Version 2.0; the full license text is in the LICENSE file in this directory
+(MimicKit's LICENSE, verbatim).
+
+--------------------------------------------------------------------------
+MimicKit
+--------------------------------------------------------------------------
+  https://github.com/xbpeng/MimicKit, commit 2ed1e6c093bb0829f55d33cb4f7a1731cfe6cb69
+  Copyright 2025, Xue Bin Peng. Licensed under the Apache License, Version 2.0.
+  Upstream ships no NOTICE file.
+
+  Modifications by the TOPPO authors (2026): every modified upstream file carries a change
+  notice at its top; the modifications are listed in CHANGES.md and are contained in
+  patches/0001-toppo-modifications-to-mimickit-2ed1e6c.patch. Five added files in
+  overlay/mimickit/learning/ contain code adapted from MimicKit and say so in their headers:
+  amp_sac_agent.py and amp_sac_model.py (from amp_agent.py and amp_model.py), sac_agent.py
+  (from base_agent.py and ppo_agent.py), sac_model.py (from ppo_model.py) and
+  distribution_tanh_gaussian.py (from distribution_gaussian_diag.py).
+  The configurations in overlay/data/ are derived from MimicKit's as well: the 9 PPO agent
+  configs are modified copies of data/agents/amp_task_humanoid_agent.yaml, the 16 SAC agent
+  configs reuse its network, discriminator and reward settings, and the training and
+  evaluation env configs are modified copies of data/envs/amp_steering_humanoid_env.yaml.
+  Each of these 27 files carries a change notice at its top naming its upstream source, and
+  CHANGES.md lists the changes.
+
+--------------------------------------------------------------------------
+DeepMimic motion data (downloaded by setup.sh, not redistributed here)
+--------------------------------------------------------------------------
+  https://github.com/xbpeng/DeepMimic, data/motions/humanoid3d_walk.txt
+  MIT License, Copyright (c) 2018 Xue Bin Peng (third_party/deepmimic/LICENSE).
+  The DeepMimic paper states that its clips were derived from motion-capture data from
+  mocap.cs.cmu.edu and mocap.cs.sfu.ca; see those databases for the terms of the original
+  recordings.
+
+--------------------------------------------------------------------------
+Methods and code followed (also credited in the docstrings of the files named)
+--------------------------------------------------------------------------
+  AMP: Adversarial Motion Priors, Peng et al., ACM TOG 2021 (the AMP agent is MimicKit's).
+  FairGrad, Ban and Ji, 2024. The SciPy least-squares fallback in toppo.py follows the
+    formulation of https://github.com/OptMN-Lab/FairGrad (methods/weight_methods.py),
+    MIT License, Copyright (c) 2024 OptMN-Lab.
+  ARS: Adaptive Reward Scaling, Cho et al., ICML 2025. sac_agent.py reimplements its
+    reward-scale rule and learner reset in PyTorch for the AMP reward components; reference
+    implementation https://github.com/ms-cho/Adaptive-Reward-Scaling-ARS-for-MTRL (MIT).
+  Reward normalization in w5_norm.py follows the update order of VecNormalize in
+    https://github.com/openai/baselines (MIT License, Copyright (c) 2017 OpenAI).
+  Return-based scaling: Schaul et al., 2021 (arXiv:2105.05347).
+  HL-Gauss: Farebrother et al., 2024 (arXiv:2403.03950).
+  PCGrad: Yu et al., 2020. PopArt: van Hasselt et al., 2016; Hessel et al., 2019.
+
+--------------------------------------------------------------------------
+Runtime dependencies (installed by the user, not redistributed here)
+--------------------------------------------------------------------------
+  Newton (https://github.com/newton-physics/newton), NVIDIA Warp, MuJoCo and MuJoCo Warp:
+    all Apache License 2.0.
+  PyTorch, NumPy, SciPy, Gymnasium and the other packages in requirements.txt keep their own
+    licenses.
