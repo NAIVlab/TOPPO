@@ -21,9 +21,9 @@
 #   For the 10-seed grid use slurm/site_a100/launch_mt50_grid.sh.
 #
 # wandb: project ${WANDB_PROJECT:-toppo-repro}, name
-# sac_mt50_<arm>_s<seed>${NAME_SUFFIX}, group = name minus _s<seed>, tags
-# mt50,sac.  The public W&B runs carry the mt50v2_sac_* group names of the
-# root docs/RUNS.md instead (see the arm table in README.md); append
+# sac_<mt50|mt10>_<arm>_s<seed>${NAME_SUFFIX}, group = name minus _s<seed>,
+# tags <mt50|mt10>,sac.  The public W&B runs carry the mt50v2_sac_* (and
+# mt10v2_sac_*) group names of the root docs/RUNS.md instead (see the arm table in README.md); append
 # wandb_group=<that group> as an extra k=v to log under it.  WANDB_MODE
 # defaults to online, which needs outbound access from the compute nodes;
 # set WANDB_MODE=offline to log locally and `wandb sync` from a login node.
@@ -33,7 +33,8 @@
 # Env-var knobs (all optional):
 #   BW_CONDA_ROOT (default ${CLUSTER_SCRATCH:-/scratch/$USER}/miniforge3)
 #   BW_CONDA_ENV  (default ars_mw3 — build with slurm/site_a100/setup_env_mw3.sh)
-#   MAX_STEPS     (default 2000000 loop iterations = 2M/task = 100M total)
+#   BENCHMARK     (default MT50; MT10 for the MT10 reruns, see below)
+#   MAX_STEPS     (default 2000000 loop iterations = 2M/task = 100M total on MT50, 20M on MT10)
 #   NAME_SUFFIX   (default empty; use it to disambiguate concurrent waves)
 #   NODE_SCRATCH  (node-local scratch root for TMPDIR and async checkpoints;
 #                  default /tmp)
@@ -120,8 +121,23 @@ case "$ARM" in
               AA="hidden_dim=400 critic_layernorm=True critic_init_layernorm=True rank=16 threshold=0.65" ;;
   *) echo "bad arm: '$ARM'" >&2; exit 2 ;;
 esac
-name="sac_mt50_${ARM}_s${S}${NAME_SUFFIX}"
-group="sac_mt50_${ARM}${NAME_SUFFIX}"   # NOT ${name%_s*}: that would eat the suffix
+# BENCHMARK picks the suite: MT50 (default; upstream's MT50 recipe) or MT10
+# (upstream's MT10 recipe on the same protocol: 4 learner resets, a 1M-transition
+# replay buffer per task, evaluation every 10k iterations = 100k env steps, and
+# ARS-LoRA at rank 8 / attach threshold 0.8).  The camera-ready reran the five
+# arms ars, ars_ln, ars_ln1024, ars_lora and mtsac on MT10; the two transplant
+# arms were run on MT50 only.  MAX_STEPS stays 2M iterations: x 10 envs = 20M.
+BENCHMARK="${BENCHMARK:-MT50}"
+case "$BENCHMARK" in
+  MT50) PROTO_ENV="env_name=MT50"; PROTO_HP="replay_buffer_size=500000 n_reset=6 eval_interval=20000" ;;
+  MT10) PROTO_ENV="env_name=MT10"; PROTO_HP="replay_buffer_size=1000000 n_reset=4 eval_interval=10000"
+        case "$ARM" in mtsac_cb|mtsac_fullstack) echo "arm '$ARM' was not run on MT10" >&2; exit 2 ;; esac
+        if [ "$ARM" = ars_lora ]; then AA="${AA/rank=16 threshold=0.65/rank=8 threshold=0.8}"; fi ;;
+  *) echo "bad BENCHMARK: '$BENCHMARK' (MT50 | MT10)" >&2; exit 2 ;;
+esac
+bm=$(printf '%s' "$BENCHMARK" | tr '[:upper:]' '[:lower:]')
+name="sac_${bm}_${ARM}_s${S}${NAME_SUFFIX}"
+group="sac_${bm}_${ARM}${NAME_SUFFIX}"   # NOT ${name%_s*}: that would eat the suffix
 # Offload + resume wiring.  BOTH modes restore from the remote when the local
 # checkpoint is absent (sync-mode offload DELETES local copies after upload,
 # so without this a resubmit would silently restart from scratch).  Without
@@ -151,17 +167,18 @@ echo "host=$(hostname) arm=$ARM seed=$S name=$name max_steps=$MAX_STEPS extra=$*
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1
 
 # Protocol: MetaWorld 3.0.0 V2 reward, H=500,
-# eval = deterministic, all 50 benchmark goals/task, every 1M total env steps
+# eval = deterministic, all 50 benchmark goals/task, every 1M total env steps on
+# MT50 (100k on MT10)
 # (mtrl test/mean_win_rate + test_win_rate/<task> keys, x-axis = total steps).
 # shellcheck disable=SC2086
 python -u run_experiments.py --main_module_name "$MOD" --seeds "$S" \
-  --config_args domain=metaworld3 env_name=MT50 activation=tanh n_layer=4 \
-    batch_size=100 replay_buffer_size=500000 n_reset=6 \
-    eval_interval=20000 eval_distribution=det rf_version=v2 \
+  --config_args domain=metaworld3 $PROTO_ENV activation=tanh n_layer=4 \
+    batch_size=100 $PROTO_HP \
+    eval_distribution=det rf_version=v2 \
     max_steps="$MAX_STEPS" checkpoint_interval=100000 resume=auto checkpoint_dir="$ckpt_dir" \
     $AA \
     project="${WANDB_PROJECT:-toppo-repro}" wandb_name="$name" \
-    wandb_group="$group" wandb_tags="${WANDB_TAGS:-mt50,sac}" "$@"
+    wandb_group="$group" wandb_tags="${WANDB_TAGS:-${bm},sac}" "$@"
 status=$?
 if [ -n "$worker_pid" ]; then
   kill "$worker_pid" 2>/dev/null || true

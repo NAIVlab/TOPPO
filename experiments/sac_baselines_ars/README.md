@@ -18,9 +18,9 @@ excluding documentation and the patch file):
 
 | | lines |
 |---|---:|
-| files we wrote from scratch (11) | **1,364** |
-| lines we added to upstream files (11 files, 3,037 → 4,189: +1,354 / −202) | **net +1,152** |
-| upstream lines still present (22 files: 11 modified, 11 unmodified) | 5,006 |
+| files we wrote from scratch (11) | **1,449** |
+| lines we added to upstream files (11 files, 3,037 → 4,215: +1,383 / −205) | **net +1,178** |
+| upstream lines still present (22 files: 11 modified, 11 unmodified) | 5,003 |
 | upstream vendored code we removed | **251,392** (1,006 files) |
 
 The 11 unmodified upstream files (`policy.py`, `actor.py`, `learner_moore.py`,
@@ -29,8 +29,8 @@ The 11 unmodified upstream files (`policy.py`, `actor.py`, `learner_moore.py`,
 to `67f7df3`, as does `LICENSE`. Upstream's `README.md` and `requirements.txt` are replaced
 outright by ours (this file, and dependency pins for the Meta-World 3.0.0 / JAX 0.4.24 stack).
 
-Both training entry points more than doubled: `train_ars.py` 232 → 521,
-`train_ars_lora.py` 239 → 663.
+Both training entry points more than doubled: `train_ars.py` 232 → 532,
+`train_ars_lora.py` 239 → 678.
 
 ## Why the numbers here are not "reproductions"
 
@@ -53,10 +53,10 @@ audit behind the protocol, and the observed gaps against published values, are i
 | File | Lines | Purpose |
 |---|---:|---|
 | `metaworld3_ars.py` | 316 | Meta-World 3.0.0 backend, V1/V2 reward switch, and the 50-goal evaluation protocol |
-| `checkpoint_utils.py` | 319 | preemption-safe checkpointing |
+| `checkpoint_utils.py` | 350 | preemption-safe checkpointing |
 | `fairgrad_host.py` | 132 | host-side α-fairness solver (numpy port of the PPO stack's y-space Newton solver) |
 | `popart_jax.py` | 104 | PopArt target normalization for the JAX critic |
-| `slurm/`, `scripts/` | 493 | launchers and environment setup |
+| `slurm/`, `scripts/` | 547 | launchers and environment setup |
 
 ## Attribution is unaffected by any of this
 
@@ -118,6 +118,39 @@ To run the 10-seed grid on Slurm, use `slurm/site_a100/launch_mt50_grid.sh` (all
 default, dry-run unless `-y`) or `scripts/launch_mt50.sh <arm> <seed>...`, which submits
 `slurm/site_3090_mt50_run.sbatch`. Both sbatch files are site templates; their headers list the
 environment variables they read.
+
+### MT10
+
+The camera-ready also reports five of these arms on MT10 (Table 2; the four ARS arms also in the
+appendix learning-curve figure). Set
+`BENCHMARK=MT10` for any of the launchers above, e.g. `BENCHMARK=MT10 scripts/launch_mt50.sh ars 0 1`
+or `BENCHMARK=MT10 bash slurm/site_a100/launch_mt50_grid.sh` (its MT10 default is the five arms).
+The protocol is unchanged (Meta-World 3.0.0, V2 rewards, H=500, deterministic evaluation on all
+50 goals per task); the hyperparameters follow upstream's MT10 recipe instead of its MT50 one, so
+the shared protocol line becomes
+
+```
+domain=metaworld3 env_name=MT10 activation=tanh n_layer=4 batch_size=100
+replay_buffer_size=1000000 n_reset=4 eval_interval=10000 eval_distribution=det
+rf_version=v2 max_steps=2000000
+```
+
+and `ars_lora` uses `rank=8 threshold=0.8`. 2M iterations × 10 task environments are the paper's
+20M env steps; evaluation runs every 100k env steps. Runs log as `sac_mt10_<arm>_s<seed>`.
+
+| arm | paper label | public W&B group (`docs/RUNS.md`) |
+|---|---|---|
+| `ars` | ARS | `mt10v2_sac_ad_cd_nars_ln0_vcx_400x4` |
+| `ars_ln` | ARS-LN-400 | `mt10v2_sac_ad_cd_nars_lnci_vcx_400x4` |
+| `ars_ln1024` | ARS-LN-1024 | `mt10v2_sac_ad_cd_nars_lnci_vcx_1024x4` |
+| `ars_lora` | ARS-LoRA | `mt10v2_sac_ad_cd_nars_lnci_vcx_400x4_lora8` |
+| `mtsac` | SAC-MT (MTSAC) | `mt10v2_sac_ad_cd_nnone_ln0_vcx_400x4` |
+
+`mtsac_cb` and `mtsac_fullstack` were run on MT50 only; the launchers and both sbatch templates
+refuse them with `BENCHMARK=MT10`. Unlike the MT50 line, these MT10 values are not the trainers'
+`Config` defaults, so a run outside the launchers must pass them explicitly. With `n_reset=4` the ARS reset interval (400k iterations) divides the 2M-iteration
+budget; the trainers skip the reset or LoRA attach that would otherwise fall on the final
+iteration, after the final evaluation, so the saved final checkpoint is the evaluated policy.
 
 ### One seed without Slurm
 

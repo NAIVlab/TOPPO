@@ -18,7 +18,8 @@
 #   - mtsac_fullstack = mtsac_cb + actor_method=pcgrad (the paper's full
 #     four-module stack ported to MTSAC; PCGrad-a path is the upstream ARS
 #     implementation, see learner_sac_mt.py)
-# Usage: sbatch slurm/site_3090_mt50_run.sbatch <arm> [seed] [extra k=v...]
+# Usage: [BENCHMARK=MT10] sbatch slurm/site_3090_mt50_run.sbatch <arm> [seed] [extra k=v...]
+#   BENCHMARK: MT50 (default) or MT10 (see the block after the arm table)
 #   arm: ars | ars_ln | ars_ln1024 | ars_lora | mtsac | mtsac_cb | mtsac_fullstack
 set -u
 ARM="${1:?arm required: ars|ars_ln|ars_ln1024|ars_lora|mtsac|mtsac_cb|mtsac_fullstack}"; S="${2:-0}"
@@ -55,8 +56,23 @@ case "$ARM" in
               AA="hidden_dim=400 critic_layernorm=True critic_init_layernorm=True rank=16 threshold=0.65" ;;
   *) echo "bad arm: '$ARM'" >&2; exit 2 ;;
 esac
-name="sac_mt50_${ARM}_s${S}${NAME_SUFFIX}"
-group="sac_mt50_${ARM}${NAME_SUFFIX}"
+# BENCHMARK picks the suite: MT50 (default; upstream's MT50 recipe) or MT10
+# (upstream's MT10 recipe on the same protocol: 4 learner resets, a 1M-transition
+# replay buffer per task, evaluation every 10k iterations = 100k env steps, and
+# ARS-LoRA at rank 8 / attach threshold 0.8).  The camera-ready reran the five
+# arms ars, ars_ln, ars_ln1024, ars_lora and mtsac on MT10; the two transplant
+# arms were run on MT50 only.  MAX_STEPS stays 2M iterations: x 10 envs = 20M.
+BENCHMARK="${BENCHMARK:-MT50}"
+case "$BENCHMARK" in
+  MT50) PROTO_ENV="env_name=MT50"; PROTO_HP="replay_buffer_size=500000 n_reset=6 eval_interval=20000" ;;
+  MT10) PROTO_ENV="env_name=MT10"; PROTO_HP="replay_buffer_size=1000000 n_reset=4 eval_interval=10000"
+        case "$ARM" in mtsac_cb|mtsac_fullstack) echo "arm '$ARM' was not run on MT10" >&2; exit 2 ;; esac
+        if [ "$ARM" = ars_lora ]; then AA="${AA/rank=16 threshold=0.65/rank=8 threshold=0.8}"; fi ;;
+  *) echo "bad BENCHMARK: '$BENCHMARK' (MT50 | MT10)" >&2; exit 2 ;;
+esac
+bm=$(printf '%s' "$BENCHMARK" | tr '[:upper:]' '[:lower:]')
+name="sac_${bm}_${ARM}_s${S}${NAME_SUFFIX}"
+group="sac_${bm}_${ARM}${NAME_SUFFIX}"
 ckpt_dir="checkpoints/${group}/${name}"
 mkdir -p "$ckpt_dir"
 
@@ -65,10 +81,10 @@ nvidia-smi --query-gpu=name,memory.total --format=csv,noheader | head -1
 
 # shellcheck disable=SC2086
 python -u run_experiments.py --main_module_name "$MOD" --seeds "$S" \
-  --config_args domain=metaworld3 env_name=MT50 activation=tanh n_layer=4 \
-    batch_size=100 replay_buffer_size=500000 n_reset=6 \
-    eval_interval=20000 eval_distribution=det rf_version=v2 \
+  --config_args domain=metaworld3 $PROTO_ENV activation=tanh n_layer=4 \
+    batch_size=100 $PROTO_HP \
+    eval_distribution=det rf_version=v2 \
     max_steps="$MAX_STEPS" checkpoint_interval=100000 resume=auto checkpoint_dir="$ckpt_dir" \
     $AA \
     project="${WANDB_PROJECT:-toppo-repro}" wandb_name="$name" \
-    wandb_group="$group" wandb_tags="${WANDB_TAGS:-mt50,sac}" "$@"
+    wandb_group="$group" wandb_tags="${WANDB_TAGS:-${bm},sac}" "$@"

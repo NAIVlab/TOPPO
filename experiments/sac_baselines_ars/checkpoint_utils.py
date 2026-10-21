@@ -16,8 +16,12 @@ Layout (one rolling checkpoint + one safety predecessor):
 Atomicity: everything is written into a tmp dir first, then swapped in with
 os.rename, so a SIGKILL mid-save can never corrupt an existing checkpoint.
 Stale ``.tmp.*`` dirs from killed saves (any pid) are swept at the start of
-the next save.  ``prev`` is pruned BEFORE the tmp write so peak disk usage is
-~2x one checkpoint (latest + tmp), not 3x; ``latest`` stays intact throughout.
+the next save.  ``prev`` is pruned BEFORE the tmp write only when ``latest``
+is complete, so peak disk usage is ~2x one checkpoint (latest + tmp) and at
+least one complete checkpoint exists at every instant.  If a kill landed
+between the two publishing renames (only ``prev`` left), ``prev`` is kept
+until the replacement is published.  ``meta.json`` is written last, after the
+learner, buffer and any trainer extras, and lists the extras it requires.
 
 Single-writer assumption: one process per checkpoint dir. Two jobs sharing a
 dir (double-submitted grid entry) can race the rotation — don't do that.
@@ -33,7 +37,7 @@ import json
 import os
 import shutil
 import subprocess
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import flax.serialization
 import jax
@@ -139,17 +143,26 @@ def save_checkpoint(
     replay_buffer,
     rew_scale: Optional[np.ndarray],
     save_buffer: bool = True,
+    extra_writer: Optional[Callable[[str], List[str]]] = None,
 ) -> str:
-    """Write a complete checkpoint atomically; returns the checkpoint path."""
+    """Write a complete checkpoint atomically; returns the checkpoint path.
+
+    ``extra_writer(tmp_dir)`` lets a trainer add side files before the
+    checkpoint is published; it returns their names, which are recorded in
+    meta.json and required by the completeness check."""
     os.makedirs(ckpt_dir, exist_ok=True)
     # Sweep stale tmp dirs from ANY previous (killed) save — pids differ across
     # restarts, so match the prefix, not our own pid. Single-writer assumption.
     for stale in glob.glob(os.path.join(ckpt_dir, ".tmp.*")):
         shutil.rmtree(stale, ignore_errors=True)
-    # Prune prev BEFORE writing tmp: peak disk = latest + tmp (~2x), and
-    # `latest` remains valid at every instant of the sequence.
+    # Prune prev BEFORE writing tmp only while a complete `latest` exists:
+    # peak disk = latest + tmp (~2x), and a complete checkpoint survives every
+    # instant of the sequence.  Without a complete latest, prev is the only
+    # recoverable checkpoint and is kept until the replacement is published.
     prev = os.path.join(ckpt_dir, "prev")
-    if os.path.isdir(prev):
+    latest = os.path.join(ckpt_dir, "latest")
+    latest_ok = _is_complete(latest)
+    if latest_ok and os.path.isdir(prev):
         shutil.rmtree(prev)
     tmp = os.path.join(ckpt_dir, f".tmp.{os.getpid()}")
     os.makedirs(tmp)
@@ -167,8 +180,6 @@ def save_checkpoint(
         "buffer_saved": bool(save_buffer),
         "np_random_state": _np_random_state_to_json(),
     }
-    with open(os.path.join(tmp, META_NAME), "w") as f:
-        json.dump(meta, f)
 
     if agent is not None:
         host = jax.device_get(_learner_state(agent))
@@ -184,9 +195,15 @@ def save_checkpoint(
         # minutes; disk is the cheap resource here.
         np.savez(os.path.join(tmp, BUFFER_NAME), **arrays)
 
-    latest = os.path.join(ckpt_dir, "latest")
-    if os.path.isdir(latest):
-        os.rename(latest, prev)
+    meta["extra_files"] = list(extra_writer(tmp)) if extra_writer is not None else []
+    # meta.json last: its presence marks every other file as fully written.
+    with open(os.path.join(tmp, META_NAME), "w") as f:
+        json.dump(meta, f)
+
+    if latest_ok:
+        os.rename(latest, prev)  # prev was pruned above
+    elif os.path.isdir(latest):
+        shutil.rmtree(latest)  # torn latest; prev (if any) stays as fallback
     os.rename(tmp, latest)
     return latest
 
@@ -240,6 +257,9 @@ def _is_complete(d: str) -> bool:
         os.path.join(d, BUFFER_NAME)
     ):
         return False
+    for name in meta.get("extra_files", []):
+        if not os.path.isfile(os.path.join(d, name)):
+            return False
     return True
 
 
@@ -267,6 +287,17 @@ def resumable_candidates(ckpt_dir: str) -> List[str]:
         for cand in ("latest", "prev")
         if _is_complete(d := os.path.join(ckpt_dir, cand))
     ]
+
+
+def quarantine(ckpt_path: str) -> None:
+    """Move a checkpoint that passed the completeness check but failed to
+    load out of the rotation (to ``<path>.rejected``), so the next save sees
+    no complete ``latest`` and keeps the ``prev`` the run resumed from."""
+    dest = ckpt_path.rstrip("/") + ".rejected"
+    if os.path.isdir(dest):
+        shutil.rmtree(dest)
+    os.rename(ckpt_path, dest)
+    print(f"[resume] quarantined unloadable checkpoint {ckpt_path} -> {dest}")
 
 
 def find_resumable(ckpt_dir: str) -> Optional[str]:

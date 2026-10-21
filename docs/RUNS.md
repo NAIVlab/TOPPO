@@ -103,6 +103,11 @@ mt{10,50}v{1,2}_{ppo,sac}_a<actor>_c<critic>_n<normalizer>_<ln>_<vc>_<arch>[_<va
 | `mt10v2_ppo_ad_cfg1_nnone_lnc_vc1_400x3` | `configs/ppo_mt10_fairgrad.yaml` | `--ppo.no-use-popart --gradient.actor-method default` | 20M |
 | `mt10v2_ppo_ad_cfg1_npaw_lnc_vc1_400x3` | `configs/ppo_mt10_fairgrad.yaml` | `--gradient.actor-method default` | 20M |
 | `mt10v2_ppo_apc_cfg1_npaw_lnc_vc1_400x3` | `configs/ppo_mt10_toppo_lnc_rfv2.yaml` | — | 20M |
+| `mt10v2_sac_ad_cd_nars_ln0_vcx_400x4` | — | ARS arm `ars` with `BENCHMARK=MT10`, see [MT10 arms](../experiments/sac_baselines_ars/README.md#mt10) | 20M |
+| `mt10v2_sac_ad_cd_nars_lnci_vcx_1024x4` | — | ARS arm `ars_ln1024` with `BENCHMARK=MT10`, see [MT10 arms](../experiments/sac_baselines_ars/README.md#mt10) | 20M |
+| `mt10v2_sac_ad_cd_nars_lnci_vcx_400x4` | — | ARS arm `ars_ln` with `BENCHMARK=MT10`, see [MT10 arms](../experiments/sac_baselines_ars/README.md#mt10) | 20M |
+| `mt10v2_sac_ad_cd_nars_lnci_vcx_400x4_lora8` | — | ARS arm `ars_lora` (runs `train_ars_lora`) with `BENCHMARK=MT10`, see [MT10 arms](../experiments/sac_baselines_ars/README.md#mt10) | 20M |
+| `mt10v2_sac_ad_cd_nnone_ln0_vcx_400x4` | — | ARS arm `mtsac` with `BENCHMARK=MT10`, see [MT10 arms](../experiments/sac_baselines_ars/README.md#mt10) | 20M |
 | `mt50v1_ppo_ad_cd_nhg1000rew_lnc_vc0_400x3` | `configs/ppo_mt50_hlgaussrewnorm_lnc_rfv1.yaml` | — | 100M |
 | `mt50v1_ppo_ad_cd_nhg101_lnc_vc0_400x3` | `configs/ppo_mt50_hlgauss_lnc_rfv1.yaml` | — | 100M |
 | `mt50v1_ppo_ad_cd_nhg101rew_lnc_vc0_400x3` | `configs/ppo_mt50_hlgaussrewnorm101_lnc_rfv1.yaml` | — | 100M |
@@ -145,13 +150,14 @@ mt{10,50}v{1,2}_{ppo,sac}_a<actor>_c<critic>_n<normalizer>_<ln>_<vc>_<arch>[_<va
 | `mt50v2_sac_ad_cfg1_npae_lnc_vcx_400x4` | — | ARS arm `mtsac_cb`, see [arm table](../experiments/sac_baselines_ars/README.md#arms) | 100M |
 | `mt50v2_sac_apc_cfg1_npae_lnc_vcx_400x4` | — | ARS arm `mtsac_fullstack`, see [arm table](../experiments/sac_baselines_ars/README.md#arms) | 100M |
 
-The 7 `mt50v2_sac_*` rows run from `experiments/sac_baselines_ars/` instead:
+The 12 SAC rows (7 `mt50v2_sac_*`, 5 `mt10v2_sac_*`) run from `experiments/sac_baselines_ars/` instead:
 `mkdir -p logs && sbatch slurm/site_a100/mt50_run.sbatch <arm> <seed> wandb_group=<group>` (or
 `slurm/site_3090_mt50_run.sbatch` with the same arguments). Both templates write their Slurm log
 to `logs/`, which is not in a fresh clone and which Slurm does not create; the launchers
 `slurm/site_a100/launch_mt50_grid.sh` and `scripts/launch_mt50.sh` create it themselves. That
 directory's README also has a one-seed command without Slurm. Their steps are env steps: 2M loop
-iterations × 50 task envs.
+iterations × 50 task envs (10 on MT10). The `mt10v2_sac_*` rows run the same launchers with
+`BENCHMARK=MT10`, which switches to upstream's MT10 recipe (that README's MT10 section).
 
 `mt50v2_ppo_ad_cd_nnone_ln0_vc1_400x3` mixes two evaluation intervals on W&B: seeds 0–4 and 9
 logged `logging.test_interval=1` (evaluated every epoch, 101 checkpoints) and seeds 5–8 logged 2.
@@ -334,7 +340,7 @@ them; compare configurations only on the same GPU type and CPU count.
 
 ## History gaps
 
-- 106 of the 893 Meta-World runs logged fewer history rows than the rest of their group, most by
+- 106 of the 943 Meta-World runs logged fewer history rows than the rest of their group, most by
   one or two rows.
 - The largest evaluation gaps are in two V1 reward-normalization seeds:
   `mt50v1_ppo_ad_cd_nrew_lnc_vc1_400x3` seed 6 has 32 of its 51 evaluation points (none between
@@ -460,7 +466,7 @@ pass `--entity <you> --project toppo-repro`.
 
 As of this commit: **80 rows checked, 0 mismatched**; with `--wandb`, **80 rows checked against
 793 W&B runs, 0 mismatched** (two NOTEs: the 3-seed `nhg101rew` group and the mixed evaluation
-interval of `mt50v2_ppo_ad_cd_nnone_ln0_vc1_400x3`, both described above). The remaining 10 rows
-are skipped because they have no config to check: the 7 SAC rows are configured by CLI `k=v`
-pairs in the ARS launchers rather than by YAML, and the 3 `_gjoint` rows are not reproducible
+interval of `mt50v2_ppo_ad_cd_nnone_ln0_vc1_400x3`, both described above). The remaining 15 rows
+are skipped because they have no config to check: the 12 SAC rows (7 `mt50v2_sac_*`, 5
+`mt10v2_sac_*`) are configured by CLI `k=v` pairs in the ARS launchers rather than by YAML, and the 3 `_gjoint` rows are not reproducible
 from this release (see above).

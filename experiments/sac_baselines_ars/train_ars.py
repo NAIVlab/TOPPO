@@ -359,6 +359,10 @@ def main(config: Config):
             meta = ck.load_meta(fallback[0])
             _check_meta(meta, fallback[0])
             r_agent, r_scale, start_i = _restore_from(fallback[0], meta)
+            # Keep the rejected latest out of the next save's rotation, or that
+            # save would prune the prev we just restored from.
+            if config.resume == "auto":
+                ck.quarantine(resume_path)
         if r_agent is not None:
             agent = r_agent
         if r_scale is not None:
@@ -489,7 +493,14 @@ def main(config: Config):
                 tasks=eval_rounds,
             )
 
-        if config.use_ars and i % reset_interval == 0 and i > config.batch_size:
+        # i < max_steps: no reset at the final iteration (MT10's 400k interval
+        # divides 2M); the final evaluation precedes it anyway.
+        if (
+            config.use_ars
+            and i % reset_interval == 0
+            and i > config.batch_size
+            and i < config.max_steps
+        ):
             mean_rews = np.mean(replay_buffer.rewards[:, : replay_buffer.size], axis=-1)
             rew_scale = np.reshape(
                 np.max(mean_rews) / np.maximum(mean_rews, 0.01), (n_tasks, 1)

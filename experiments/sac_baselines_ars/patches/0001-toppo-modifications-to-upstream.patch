@@ -661,7 +661,13 @@
  import numpy as np
  import tqdm
  import math
-@@ -16,6 +16,15 @@
+@@ -10,19 +10,33 @@
+ import wandb
+ from dataclasses import dataclass, asdict
+ 
+-from learner_sac_mt_lora import Learner
+ from dataset_utils import MultiTaskReplayBuffer
+ import utils
  
  os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
  
@@ -677,7 +683,7 @@
  
  @dataclass
  class Config:
-@@ -23,6 +32,12 @@
+     # wandb params
 -    project: str = "MTRL"
 +    project: str = "toppo-repro"
      group: str = ""
@@ -691,7 +697,7 @@
      # model params
      actor_lr: float = 3e-4
      critic_lr: float = 3e-4
-@@ -35,29 +50,64 @@
+@@ -35,29 +49,64 @@
      critic_layernorm: bool = False
      critic_init_layernorm: bool = False
      dropout_rate: float = -1.0  # -1.0 means no dropout
@@ -764,7 +770,7 @@
          self.group = f"{self.domain}-{self.env_name}(H={self.max_path_length})"
          reset_interval = math.ceil(self.max_steps / (1000 * (self.n_reset + 1))) * 1000
          if reset_interval % 1e5 == 0:
-@@ -71,37 +121,168 @@
+@@ -71,37 +120,173 @@
              alg_name += "-LN"
  
          self.name = f"{alg_name}-NReset{self.n_reset}-Interval{r_interval}e5"
@@ -865,6 +871,12 @@
 +
 +
 +def main(config: Config):
++    # Fork MetaWorld workers before importing JAX/Flax or starting W&B
++    # (same order as train_ars.py): forking after JAX creates its thread
++    # pools can deadlock in child workers.
++    env, eval_env, env_names, action_dim, n_envs, eval_rounds = setup_envs(config)
++
++    from learner_sac_mt_lora import Learner
 +    import checkpoint_utils as ck
 +
 +    # Upstream never seeds np.random (replay-buffer sampling uses it), so
@@ -936,7 +948,6 @@
 +        resume="allow",
 +    )
 +
-+    env, eval_env, env_names, action_dim, n_envs, eval_rounds = setup_envs(config)
 +    # n_envs = TOTAL env slots.  This trainer runs one copy per task, so
 +    # gpu_k is always 1 and n_tasks == n_envs; the split is kept for
 +    # structural parity with train_ars.py (learner / replay buffer / alpha /
@@ -946,7 +957,7 @@
      kwargs_ = asdict(config)
      kwargs_["hidden_dims"] = tuple([config.hidden_dim for _ in range(config.n_layer)])
      learner_args = inspect.signature(Learner).parameters.keys()
-@@ -113,32 +294,246 @@
+@@ -113,32 +298,255 @@
      replay_buffer = MultiTaskReplayBuffer(
          env.observation_space,
          action_dim,
@@ -1117,6 +1128,10 @@
 +            r_agent, r_scale, r_base, r_lscale, r_esucc, start_i = _restore_from(
 +                fallback[0], meta
 +            )
++            # Keep the rejected latest out of the next save's rotation, or that
++            # save would prune the prev we just restored from.
++            if config.resume == "auto":
++                ck.quarantine(resume_path)
 +        if r_agent is not None:
 +            agent = r_agent
 +        if r_scale is not None:
@@ -1137,6 +1152,34 @@
 +        return
 +
 +    def _save(i_now: int) -> None:
++        # LoRA-arm side files are staged into the checkpoint's tmp dir and
++        # listed in meta.json, so the checkpoint is published (and judged
++        # complete) only once they are fully written.
++        import flax.serialization
++        import jax
++
++        def _write_lora_side(tmp_dir: str):
++            attached = agent is not None and agent.use_lora
++            side = {
++                "lora_attached": bool(attached),
++                "rew_scale_base": (
++                    None if rew_scale_base is None else np.asarray(rew_scale_base).tolist()
++                ),
++                "lora_scale": (
++                    None if lora_scale is None else np.asarray(lora_scale).tolist()
++                ),
++                "eval_success": np.asarray(eval_success, dtype=float).tolist(),
++            }
++            with open(os.path.join(tmp_dir, LORA_META_NAME), "w") as f:
++                json.dump(side, f)
++            written = [LORA_META_NAME]
++            if attached:
++                host = jax.device_get(_lora_state(agent))
++                with open(os.path.join(tmp_dir, LORA_STATE_NAME), "wb") as f:
++                    f.write(flax.serialization.to_bytes(host))
++                written.append(LORA_STATE_NAME)
++            return written
++
 +        path = ck.save_checkpoint(
 +            ckpt_dir,
 +            iteration=i_now,
@@ -1146,31 +1189,8 @@
 +            replay_buffer=replay_buffer,
 +            rew_scale=rew_scale,
 +            save_buffer=config.checkpoint_buffer,
++            extra_writer=_write_lora_side,
 +        )
-+        # LoRA-arm side files (checkpoint_utils has no extension point and
-+        # stays untouched): written into the completed dir right after the
-+        # atomic swap, BEFORE any offload.  _restore_from treats a missing
-+        # lora_meta.json as a torn checkpoint and falls back to prev.
-+        import flax.serialization
-+        import jax
-+
-+        attached = agent is not None and agent.use_lora
-+        side = {
-+            "lora_attached": bool(attached),
-+            "rew_scale_base": (
-+                None if rew_scale_base is None else np.asarray(rew_scale_base).tolist()
-+            ),
-+            "lora_scale": (
-+                None if lora_scale is None else np.asarray(lora_scale).tolist()
-+            ),
-+            "eval_success": np.asarray(eval_success, dtype=float).tolist(),
-+        }
-+        with open(os.path.join(path, LORA_META_NAME), "w") as f:
-+            json.dump(side, f)
-+        if attached:
-+            host = jax.device_get(_lora_state(agent))
-+            with open(os.path.join(path, LORA_STATE_NAME), "wb") as f:
-+                f.write(flax.serialization.to_bytes(host))
 +        print(f"[checkpoint] saved iteration {i_now} -> {path}")
 +        if os.environ.get("CHECKPOINT_ASYNC", "0") not in {"1", "true", "True"}:
 +            ck.offload_checkpoint(path)
@@ -1202,7 +1222,7 @@
                      **kwargs,
                  )
              actions = agent.sample_actions(np.array(observations), distribution="stc")
-@@ -158,26 +553,41 @@
+@@ -158,26 +566,41 @@
                  success[env_id] += info["success"]
                  env_id += 1
  
@@ -1251,7 +1271,7 @@
  
          if i % config.eval_interval == 0 and i > config.initial_step:
              eval_returns_, eval_success = utils.run_eval(
-@@ -185,9 +595,14 @@
+@@ -185,37 +608,45 @@
                  agent,
                  eval_env,
                  config.eval_episodes,
@@ -1267,7 +1287,11 @@
              )
              eval_returns.append((i, *eval_returns_))
  
-@@ -196,26 +611,27 @@
+-        if i % reset_interval == 0 and i > config.batch_size:
++        # i < max_steps: no reset/attach at the final iteration (MT10's
++        # 400k interval divides 2M); the final evaluation precedes it anyway.
++        if i % reset_interval == 0 and i > config.batch_size and i < config.max_steps:
+             if not agent.use_lora:
                  rew_scale_base = rew_scale.copy()
              mean_rews = np.mean(replay_buffer.rewards[:, : replay_buffer.size], axis=-1)
              rew_scale = np.reshape(
@@ -1299,7 +1323,7 @@
                      actor_lr=kwargs_["actor_lr"],
                      critic_lr=kwargs_["critic_lr"],
                      n_critic=config.n_critic,
-@@ -229,6 +645,14 @@
+@@ -229,6 +660,14 @@
              for _ in range(int(1e3)):
                  batch = replay_buffer.sample(config.batch_size, rew_scale=rew_scale)
                  update_info = agent.update(batch)
@@ -1314,7 +1338,7 @@
      env.close()
      eval_env.close()
      wandb.finish()
-@@ -236,4 +660,4 @@
+@@ -236,4 +675,4 @@
  
  if __name__ == "__main__":
      config = pyrallis.parse(Config)
@@ -1330,7 +1354,10 @@
  from dataset_utils import MultiTaskReplayBuffer
  import utils
  
-@@ -22,6 +21,12 @@
+@@ -19,9 +18,15 @@
+ @dataclass
+ class Config:
+     # wandb params
 -    project: str = "MTRL"
 +    project: str = "toppo-repro"
      group: str = ""
@@ -1624,7 +1651,7 @@
      success = np.zeros(n_envs)
      reset_interval = (
          math.ceil(config.max_steps / (1000 * (config.n_reset + 1))) * 1000
-@@ -140,7 +317,86 @@
+@@ -140,7 +317,90 @@
          else config.max_steps + 1
      )
  
@@ -1671,6 +1698,10 @@
 +            meta = ck.load_meta(fallback[0])
 +            _check_meta(meta, fallback[0])
 +            r_agent, r_scale, start_i = _restore_from(fallback[0], meta)
++            # Keep the rejected latest out of the next save's rotation, or that
++            # save would prune the prev we just restored from.
++            if config.resume == "auto":
++                ck.quarantine(resume_path)
 +        if r_agent is not None:
 +            agent = r_agent
 +        if r_scale is not None:
@@ -1712,7 +1743,7 @@
          if i > config.initial_step:
              if agent is None:
                  if config.use_ars:
-@@ -148,14 +404,14 @@
+@@ -148,14 +408,14 @@
                          replay_buffer.rewards[:, : replay_buffer.size], axis=-1
                      )
                      rew_scale = np.reshape(
@@ -1730,7 +1761,7 @@
                      **kwargs,
                  )
              actions = agent.sample_actions(np.array(observations), distribution="stc")
-@@ -175,26 +431,47 @@
+@@ -175,26 +435,47 @@
                  success[env_id] += info["success"]
                  env_id += 1
  
@@ -1784,7 +1815,7 @@
  
          if i % config.eval_interval == 0 and i > config.initial_step:
              utils.run_eval(
-@@ -202,26 +479,38 @@
+@@ -202,26 +483,45 @@
                  agent,
                  eval_env,
                  config.eval_episodes,
@@ -1799,7 +1830,15 @@
 +                tasks=eval_rounds,
              )
  
-         if config.use_ars and i % reset_interval == 0 and i > config.batch_size:
+-        if config.use_ars and i % reset_interval == 0 and i > config.batch_size:
++        # i < max_steps: no reset at the final iteration (MT10's 400k interval
++        # divides 2M); the final evaluation precedes it anyway.
++        if (
++            config.use_ars
++            and i % reset_interval == 0
++            and i > config.batch_size
++            and i < config.max_steps
++        ):
              mean_rews = np.mean(replay_buffer.rewards[:, : replay_buffer.size], axis=-1)
              rew_scale = np.reshape(
 -                np.max(mean_rews) / np.maximum(mean_rews, 0.01), (n_envs, 1)
@@ -1827,7 +1866,7 @@
      env.close()
      eval_env.close()
      wandb.finish()
-@@ -229,4 +518,4 @@
+@@ -229,4 +529,4 @@
  
  if __name__ == "__main__":
      config = pyrallis.parse(Config)

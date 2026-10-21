@@ -22,7 +22,7 @@ normalization, and FairGrad at α = 1 on the critic — and adds PCGrad on the a
 |---|---|---|---|
 | **TOPPO** (685K / 717K parameters) | 97.2 ± 3.1 | **90.9 ± 1.6** | **56.5 ± 7.8** |
 | Vanilla MT-PPO, same backbone | 85.2 ± 6.5 | 78.5 ± 3.3 | 6.6 ± 9.1 |
-| ARS-LN-1024, our rerun under the same protocol | — | 85.7 ± 3.2 | 43.3 ± 9.8 |
+| ARS-LN-1024, our rerun under the same protocol | 96.9 ± 2.6 | 85.7 ± 3.2 | 43.3 ± 9.8 |
 
 Every number in this table can be recomputed from the public logs with `analysis/metrics.py`
 (see [`experiments/metaworld_ppo/README.md`](experiments/metaworld_ppo/README.md#analysis)); the
@@ -55,8 +55,8 @@ config and the training and evaluation commands.
 
 Apart from the four exceptions below, the training runs behind the paper's tables and figures are
 public, together with the additional runs indexed in [`docs/RUNS.md`](docs/RUNS.md):
-**[https://wandb.ai/liyp1220-uci/TOPPO](https://wandb.ai/liyp1220-uci/TOPPO)** — 1,143 runs in
-115 groups (90 Meta-World, 25 AMP humanoid), 10 seeds each except one 3-seed control. Every run
+**[https://wandb.ai/liyp1220-uci/TOPPO](https://wandb.ai/liyp1220-uci/TOPPO)** — 1,193 runs in
+120 groups (95 Meta-World, 25 AMP humanoid), 10 seeds each except one 3-seed control. Every run
 carries the canonical `toppo/*` parameter block. The Meta-World runs also carry per-task metrics
 and their training histories, though some histories have gaps or stop early, and 25 of the AMP
 runs carry final evaluation summaries only; `docs/RUNS.md` lists these exceptions. Four

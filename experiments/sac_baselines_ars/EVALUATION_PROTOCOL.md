@@ -97,6 +97,11 @@ the defaults alone:
 | `activation`, `n_layer`, `batch_size` | `tanh`, `4`, `100` | same (`train_ars_lora`: `relu` activation) |
 | `replay_buffer_size`, `n_reset` | `500000`, `6` (upstream's MT50 recipe) | `1000000`, `4` |
 
+The MT10 reruns (README, section MT10) keep this protocol but use upstream's MT10 recipe:
+`env_name=MT10`, `replay_buffer_size=1000000`, `n_reset=4`, `eval_interval=10000` (every 100k env
+steps), `max_steps=2000000` × 10 envs = 20M env steps, and `rank=8 threshold=0.8` for `ars_lora`.
+These are not the `Config` defaults; the launchers pass them when `BENCHMARK=MT10`.
+
 The per-arm keys are in the arm table of `README.md`. `train_moore.py` and
 `train_softmodular.py` ship unmodified from upstream, do not implement this protocol, and are not
 supported; no number in the paper comes from them.

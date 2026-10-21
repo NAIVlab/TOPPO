@@ -10,7 +10,6 @@ import pyrallis
 import wandb
 from dataclasses import dataclass, asdict
 
-from learner_sac_mt_lora import Learner
 from dataset_utils import MultiTaskReplayBuffer
 import utils
 
@@ -205,6 +204,12 @@ def _lora_state(agent):
 
 
 def main(config: Config):
+    # Fork MetaWorld workers before importing JAX/Flax or starting W&B
+    # (same order as train_ars.py): forking after JAX creates its thread
+    # pools can deadlock in child workers.
+    env, eval_env, env_names, action_dim, n_envs, eval_rounds = setup_envs(config)
+
+    from learner_sac_mt_lora import Learner
     import checkpoint_utils as ck
 
     # Upstream never seeds np.random (replay-buffer sampling uses it), so
@@ -276,7 +281,6 @@ def main(config: Config):
         resume="allow",
     )
 
-    env, eval_env, env_names, action_dim, n_envs, eval_rounds = setup_envs(config)
     # n_envs = TOTAL env slots.  This trainer runs one copy per task, so
     # gpu_k is always 1 and n_tasks == n_envs; the split is kept for
     # structural parity with train_ars.py (learner / replay buffer / alpha /
@@ -455,6 +459,10 @@ def main(config: Config):
             r_agent, r_scale, r_base, r_lscale, r_esucc, start_i = _restore_from(
                 fallback[0], meta
             )
+            # Keep the rejected latest out of the next save's rotation, or that
+            # save would prune the prev we just restored from.
+            if config.resume == "auto":
+                ck.quarantine(resume_path)
         if r_agent is not None:
             agent = r_agent
         if r_scale is not None:
@@ -475,6 +483,34 @@ def main(config: Config):
         return
 
     def _save(i_now: int) -> None:
+        # LoRA-arm side files are staged into the checkpoint's tmp dir and
+        # listed in meta.json, so the checkpoint is published (and judged
+        # complete) only once they are fully written.
+        import flax.serialization
+        import jax
+
+        def _write_lora_side(tmp_dir: str):
+            attached = agent is not None and agent.use_lora
+            side = {
+                "lora_attached": bool(attached),
+                "rew_scale_base": (
+                    None if rew_scale_base is None else np.asarray(rew_scale_base).tolist()
+                ),
+                "lora_scale": (
+                    None if lora_scale is None else np.asarray(lora_scale).tolist()
+                ),
+                "eval_success": np.asarray(eval_success, dtype=float).tolist(),
+            }
+            with open(os.path.join(tmp_dir, LORA_META_NAME), "w") as f:
+                json.dump(side, f)
+            written = [LORA_META_NAME]
+            if attached:
+                host = jax.device_get(_lora_state(agent))
+                with open(os.path.join(tmp_dir, LORA_STATE_NAME), "wb") as f:
+                    f.write(flax.serialization.to_bytes(host))
+                written.append(LORA_STATE_NAME)
+            return written
+
         path = ck.save_checkpoint(
             ckpt_dir,
             iteration=i_now,
@@ -484,31 +520,8 @@ def main(config: Config):
             replay_buffer=replay_buffer,
             rew_scale=rew_scale,
             save_buffer=config.checkpoint_buffer,
+            extra_writer=_write_lora_side,
         )
-        # LoRA-arm side files (checkpoint_utils has no extension point and
-        # stays untouched): written into the completed dir right after the
-        # atomic swap, BEFORE any offload.  _restore_from treats a missing
-        # lora_meta.json as a torn checkpoint and falls back to prev.
-        import flax.serialization
-        import jax
-
-        attached = agent is not None and agent.use_lora
-        side = {
-            "lora_attached": bool(attached),
-            "rew_scale_base": (
-                None if rew_scale_base is None else np.asarray(rew_scale_base).tolist()
-            ),
-            "lora_scale": (
-                None if lora_scale is None else np.asarray(lora_scale).tolist()
-            ),
-            "eval_success": np.asarray(eval_success, dtype=float).tolist(),
-        }
-        with open(os.path.join(path, LORA_META_NAME), "w") as f:
-            json.dump(side, f)
-        if attached:
-            host = jax.device_get(_lora_state(agent))
-            with open(os.path.join(path, LORA_STATE_NAME), "wb") as f:
-                f.write(flax.serialization.to_bytes(host))
         print(f"[checkpoint] saved iteration {i_now} -> {path}")
         if os.environ.get("CHECKPOINT_ASYNC", "0") not in {"1", "true", "True"}:
             ck.offload_checkpoint(path)
@@ -606,7 +619,9 @@ def main(config: Config):
             )
             eval_returns.append((i, *eval_returns_))
 
-        if i % reset_interval == 0 and i > config.batch_size:
+        # i < max_steps: no reset/attach at the final iteration (MT10's
+        # 400k interval divides 2M); the final evaluation precedes it anyway.
+        if i % reset_interval == 0 and i > config.batch_size and i < config.max_steps:
             if not agent.use_lora:
                 rew_scale_base = rew_scale.copy()
             mean_rews = np.mean(replay_buffer.rewards[:, : replay_buffer.size], axis=-1)
