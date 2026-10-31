@@ -193,7 +193,7 @@ bit for bit, including the 76.0% headline (p = 4.71 x 10^−6) and all confidenc
 
 ## Runs on W&B
 
-Logs: [https://wandb.ai/liyp1220-uci/TOPPO](https://wandb.ai/liyp1220-uci/TOPPO), 250 runs in the
+Logs: [https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO), 250 runs in the
 25 groups below, 10 seeds each. The group name is the canonical identifier. `arm` is the name
 the analysis scripts use; `toppo/arm` is the label stored on the W&B runs.
 

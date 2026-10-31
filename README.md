@@ -6,7 +6,7 @@ Barbara), **Rui Miao** (UT Dallas)
 *NeurIPS 2026 (poster).* Paper: [arXiv:2605.11473](https://arxiv.org/abs/2605.11473) (v1 predates
 the camera-ready; section, table and appendix numbers below follow the camera-ready) ·
 Proceedings: *link to be added* · Training logs:
-[wandb.ai/liyp1220-uci/TOPPO](https://wandb.ai/liyp1220-uci/TOPPO)
+[forge.coreweave.com/wandb/liyp1220-uci/TOPPO](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO)
 
 Code for the paper. TOPPO (Tail-Optimized PPO) revisits multi-task PPO through critic
 conditioning. In our diagnostic MT10 runs, per-task critic gradient norms (in raw-loss units)
@@ -55,7 +55,7 @@ config and the training and evaluation commands.
 
 Apart from the four exceptions below, the training runs behind the paper's tables and figures are
 public, together with the additional runs indexed in [`docs/RUNS.md`](docs/RUNS.md):
-**[https://wandb.ai/liyp1220-uci/TOPPO](https://wandb.ai/liyp1220-uci/TOPPO)** — 1,193 runs in
+**[https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO)** — 1,193 runs in
 120 groups (95 Meta-World, 25 AMP humanoid), 10 seeds each except one 3-seed control. Every run
 carries the canonical `toppo/*` parameter block. The Meta-World runs also carry per-task metrics
 and their training histories, though some histories have gaps or stop early, and 25 of the AMP
@@ -80,15 +80,15 @@ evaluation logs in the W&B project above, and checkpoints can be regenerated wit
 
 | # | Report | What it answers |
 |---|---|---|
-| 0 | [Start here](https://wandb.ai/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc5MA==) | Naming, tags, conventions, and a map of the other eight. **Start here.** |
-| 1 | [Main results on Meta-World (V2 rewards)](https://wandb.ai/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc1Mg==) | MT50 and MT10 headline, the four-module ladder, SAC/ARS under one protocol. |
-| 2 | [Why the critic](https://wandb.ai/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc2Ng==) | The diagnostics behind the critic-side hypothesis: per-task gradient spread, solver telemetry, cost. |
-| 3 | [Critic-side ablations](https://wandb.ai/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc2OA==) | Which module does what: the 8-cell cube, per-side combiners, aggregator scope, LN placement, capacity. |
-| 4 | [What changes when the reward scales do](https://wandb.ai/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc3MQ==) | The V1/V2 regime change and the published-baseline head-to-head. |
-| 5 | [Is PopArt the right critic normalizer?](https://wandb.ai/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc4MA==) | PopArt vs reward normalization vs return scaling vs HL-Gauss, and the value-clip confound. |
-| 6 | [The SAC side: baselines under one protocol, and a transplant that failed](https://wandb.ai/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc4MQ==) | Matched-protocol re-runs, and the critic stack transplanted onto MTSAC (it did not help). |
-| 7 | [The actor-side sweep that did not change anything](https://wandb.ai/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc4Mg==) | The EMA-PopArt actor-aggregation sweep of Figure 5 and Appendix E.6 (Table E.7). |
-| 8 | [The AMP humanoid family](https://wandb.ai/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MjgxOQ==) | The AMP stress test of Section 5.3 and Appendix E.5; its code and per-seed evaluation records are in `experiments/amp_humanoid/`. A second task family: one task, two conflicting rewards, one critic. |
+| 0 | [Start here](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc5MA==) | Naming, tags, conventions, and a map of the other eight. **Start here.** |
+| 1 | [Main results on Meta-World (V2 rewards)](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc1Mg==) | MT50 and MT10 headline, the four-module ladder, SAC/ARS under one protocol. |
+| 2 | [Why the critic](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc2Ng==) | The diagnostics behind the critic-side hypothesis: per-task gradient spread, solver telemetry, cost. |
+| 3 | [Critic-side ablations](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc2OA==) | Which module does what: the 8-cell cube, per-side combiners, aggregator scope, LN placement, capacity. |
+| 4 | [What changes when the reward scales do](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc3MQ==) | The V1/V2 regime change and the published-baseline head-to-head. |
+| 5 | [Is PopArt the right critic normalizer?](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc4MA==) | PopArt vs reward normalization vs return scaling vs HL-Gauss, and the value-clip confound. |
+| 6 | [The SAC side: baselines under one protocol, and a transplant that failed](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc4MQ==) | Matched-protocol re-runs, and the critic stack transplanted onto MTSAC (it did not help). |
+| 7 | [The actor-side sweep that did not change anything](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc4Mg==) | The EMA-PopArt actor-aggregation sweep of Figure 5 and Appendix E.6 (Table E.7). |
+| 8 | [The AMP humanoid family](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MjgxOQ==) | The AMP stress test of Section 5.3 and Appendix E.5; its code and per-seed evaluation records are in `experiments/amp_humanoid/`. A second task family: one task, two conflicting rewards, one critic. |
 
 On W&B, `status-paper` marks the groups the camera-ready reports, `status-design-record` the
 explorations behind a design choice, and `status-followup` the remaining follow-up runs; report 0

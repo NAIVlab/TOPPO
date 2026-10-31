@@ -11,14 +11,14 @@ Meta-World PPO rows. Four measurements are not in the public W&B project: the co
 (Appendix C.5) and the AMP H200 timings (Appendix E.5); they are described under
 [Not in the public W&B project](#not-in-the-public-wb-project).
 
-**Logs:** [https://wandb.ai/liyp1220-uci/TOPPO](https://wandb.ai/liyp1220-uci/TOPPO) — every run here is public, with a canonical
+**Logs:** [https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO) — every run here is public, with a canonical
 `toppo/*` parameter block; the Meta-World runs also carry per-task metrics and their training
 histories (see [History gaps](#history-gaps) for the exceptions).
 To recompute a Meta-World row from these logs, run `python analysis/metrics.py --groups <group>`
 from `experiments/metaworld_ppo/`; it reads liyp1220-uci/TOPPO by default. The AMP numbers are
 recomputed from the evaluation records shipped in `experiments/amp_humanoid/` (see
 [below](#amp-humanoid-stress-test)).
-[Report 0](https://wandb.ai/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc5MA==) is the guide to the project.
+[Report 0](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MTc5MA==) is the guide to the project.
 
 Meta-World PPO rows run from `experiments/metaworld_ppo/` (the SAC rows say below where they
 run). Every Meta-World row is 10 seeds (`--seed 0` .. `--seed 9`), with two exceptions:
@@ -197,7 +197,7 @@ Its code, configs and per-seed evaluation records are in
 [`experiments/amp_humanoid/`](../experiments/amp_humanoid/) (see its `README.md`); `setup.sh`
 there assembles MimicKit `2ed1e6c` plus our patch and files. All 250 runs (25 configurations ×
 10 seeds) are public and described in
-[report 8](https://wandb.ai/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MjgxOQ==).
+[report 8](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO/reports/--VmlldzoxNzg5MjgxOQ==).
 
 The AMP rows use MimicKit's own seeds, **`--rand_seed 260511470` .. `260511479`** (not
 `--seed 0..9`), and run from the assembled tree with one of two templates, which
