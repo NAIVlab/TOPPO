@@ -3,10 +3,11 @@
 **Yuanpeng Li** (UC Irvine), **Gefei Lin** (George Washington University), **Annie Qu** (UC Santa
 Barbara), **Rui Miao** (UT Dallas)
 
-*NeurIPS 2026 (poster).* Paper: [arXiv:2605.11473](https://arxiv.org/abs/2605.11473) (v1 predates
-the camera-ready; section, table and appendix numbers below follow the camera-ready) ·
-Proceedings: *link to be added* · Training logs:
-[forge.coreweave.com/wandb/liyp1220-uci/TOPPO](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO)
+*NeurIPS 2026 (poster).* Project page:
+[yuanpeng-li.github.io/toppo](https://yuanpeng-li.github.io/toppo/) · Paper:
+[arXiv:2605.11473](https://arxiv.org/abs/2605.11473) (v1 predates the camera-ready; section, table
+and appendix numbers below follow the camera-ready) · Proceedings: *link to be added* · Training
+logs: [forge.coreweave.com/wandb/liyp1220-uci/TOPPO](https://forge.coreweave.com/wandb/liyp1220-uci/TOPPO)
 
 Code for the paper. TOPPO (Tail-Optimized PPO) revisits multi-task PPO through critic
 conditioning. In our diagnostic MT10 runs, per-task critic gradient norms (in raw-loss units)
